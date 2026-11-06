@@ -1,11 +1,11 @@
 //! Runs every indexer against a Dogecoin Core node, with no web server.
 //!
 //! Settings come from the environment (see the README). The index is written
-//! to `SPOOKY_DATA_DIR`; read it with the `spookyord-indexer` library.
+//! to `DOGEORD_DATA_DIR`; read it with the `dogeord-indexer` library.
 
 use anyhow::Result;
-use spookyord_core::Config;
-use spookyord_indexer::{SharedState, run_indexer};
+use dogeord_core::Config;
+use dogeord_indexer::{SharedState, run_indexer};
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
   // were recorded. Does nothing once it has completed.
   let c = cfg.clone();
   tokio::spawn(async move {
-    if let Err(e) = spookyord_indexer::backfill_drc20_deploys(c).await {
+    if let Err(e) = dogeord_indexer::backfill_drc20_deploys(c).await {
       error!("drc20 deploy backfill failed (it retries on the next start): {e:#}");
     }
   });
@@ -36,14 +36,14 @@ async fn main() -> Result<()> {
   // was recorded. Numbering then follows the chain from 6 blocks behind.
   let c = cfg.clone();
   tokio::spawn(async move {
-    if let Err(e) = spookyord_indexer::backfill_inscription_seq(c).await {
+    if let Err(e) = dogeord_indexer::backfill_inscription_seq(c).await {
       error!("inscription order backfill stopped (it resumes on the next start): {e:#}");
     }
   });
   let c = cfg.clone();
   tokio::spawn(async move {
     loop {
-      if let Err(e) = spookyord_indexer::run_inscription_numbering(c.clone()).await {
+      if let Err(e) = dogeord_indexer::run_inscription_numbering(c.clone()).await {
         error!("inscription numbering failed, retrying in a minute: {e:#}");
       }
       tokio::time::sleep(Duration::from_secs(60)).await;
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
   let c = cfg.clone();
   tokio::spawn(async move {
     loop {
-      if let Err(e) = spookyord_indexer::run_dns_index(c.clone()).await {
+      if let Err(e) = dogeord_indexer::run_dns_index(c.clone()).await {
         error!("dns index failed, retrying in a minute: {e:#}");
       }
       tokio::time::sleep(Duration::from_secs(60)).await;

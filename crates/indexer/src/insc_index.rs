@@ -196,7 +196,7 @@ const SEQ_BACKFILL_DONE_KEY: &[u8] = b"inscription_seq_backfill_v1";
 const NUMBERING_KEY: &[u8] = b"inscription_numbering_v1";
 
 pub(crate) fn db_of(config: &Config) -> Result<store::Db> {
-  open_db(&format!("{}/spookyord.rocksdb", config.data_dir))
+  open_db(&config.db_path())
 }
 
 pub(crate) fn meta_u64(meta: &Tree, key: &[u8]) -> Result<Option<u64>> {

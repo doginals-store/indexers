@@ -178,7 +178,7 @@ impl Db {
   /// Temporary database in the system temp directory, deleted on drop.
   pub fn temporary() -> Result<Self> {
     let unique = format!(
-      "spookyord-test-{}-{}",
+      "dogeord-test-{}-{}",
       std::process::id(),
       std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -290,7 +290,7 @@ impl Db {
   /// without a full re-index.
   ///
   /// Expensive: it reads and rewrites the entire database. Intended as a
-  /// one-off migration, gated behind SPOOKY_COMPACT_ON_START.
+  /// one-off migration, gated behind DOGEORD_COMPACT_ON_START.
   pub fn compact_all(&self) -> Result<()> {
     for name in KNOWN_TREES {
       if let Some(cf) = self.inner.cf_handle(name) {

@@ -22,7 +22,7 @@ use rayon::prelude::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use spookyord_core::{Config, StatusResponse};
+use dogeord_core::{Config, StatusResponse};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -728,7 +728,7 @@ pub async fn run_indexer(
   state: SharedState,
   mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let meta = db.open_tree("meta")?;
   let blocks = db.open_tree("blocks")?;
@@ -773,7 +773,7 @@ pub async fn run_indexer(
 
   // Reconcile any heights applied beyond the recorded indexed_height.
   //
-  // Flushes are batched (SPOOKY_FLUSH_INTERVAL), so an unclean stop can leave
+  // Flushes are batched (DOGEORD_FLUSH_INTERVAL), so an unclean stop can leave
   // a block's writes durable while the indexed_height that follows them is
   // not. Resuming would then apply that block a second time, and DRC-20
   // balance updates are additive - a double apply silently inflates balances
@@ -834,8 +834,7 @@ pub async fn run_indexer(
   // inscription era, so 50,000 blocks is up to 732 GB of rollback history. The
   // index had reached 228 GB, and carrying that volume also slowed indexing,
   // since RocksDB had far more data to cache and compact.
-  let undo_retention: u64 = std::env::var("SPOOKY_UNDO_RETENTION_BLOCKS")
-    .ok()
+  let undo_retention: u64 = dogeord_core::setting("UNDO_RETENTION_BLOCKS")
     .and_then(|v| v.parse().ok())
     .unwrap_or(1_000);
   // Restored from disk. Starting at 0 meant every restart re-swept the entire
@@ -1270,7 +1269,7 @@ fn prepare_tx(tx: &RpcTx) -> Result<PreparedTx> {
 
 /// Dedicated worker pool for the prepare phase.
 ///
-/// Sized by SPOOKY_INDEX_THREADS, default 10 on this 16-core machine. A
+/// Sized by DOGEORD_INDEX_THREADS, default 10 on this 16-core machine. A
 /// dedicated pool rather than rayon's global one so the indexer's parallelism
 /// is explicit and bounded, leaving cores for the sequential apply loop, the
 /// block prefetcher, RocksDB's background compaction, and the node itself.
@@ -1278,8 +1277,7 @@ static PREPARE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
 fn prepare_pool() -> &'static rayon::ThreadPool {
   PREPARE_POOL.get_or_init(|| {
-    let threads = std::env::var("SPOOKY_INDEX_THREADS")
-      .ok()
+    let threads = dogeord_core::setting("INDEX_THREADS")
       .and_then(|v| v.parse::<usize>().ok())
       .filter(|v| *v > 0)
       .unwrap_or(10);
@@ -3249,7 +3247,7 @@ fn decode_u128(b: &[u8]) -> Result<u128> {
 }
 
 pub fn list_spendable_utxos_for_address(config: &Config, address: &str) -> Result<Vec<(String, u64)>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let outpoints_by_address = db.open_tree("outpoints_by_address")?;
   let inscriptions_by_outpoint = db.open_tree("inscriptions_by_outpoint")?;
@@ -3301,7 +3299,7 @@ pub fn list_inscriptions_for_address(
   page: usize,
   limit: usize,
 ) -> Result<(usize, Vec<InscriptionRecord>)> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let inscriptions_by_address = db.open_tree("inscriptions_by_address")?;
   let inscriptions_by_id = db.open_tree("inscriptions_by_id")?;
@@ -3338,7 +3336,7 @@ pub fn list_inscriptions_for_address(
 }
 
 pub fn get_inscription(config: &Config, inscription_id: &str) -> Result<Option<InscriptionRecord>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let inscriptions_by_id = db.open_tree("inscriptions_by_id")?;
 
@@ -3353,7 +3351,7 @@ pub fn get_inscription_content(
   config: &Config,
   inscription_id: &str,
 ) -> Result<Option<InscriptionContentRecord>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let inscription_content = db.open_tree("inscription_content")?;
   let inscriptions_by_id = db.open_tree("inscriptions_by_id")?;
@@ -3453,7 +3451,7 @@ fn decode_inscription_record(raw: &[u8]) -> Result<InscriptionRecord> {
 }
 
 pub fn list_drc20_holdings(config: &Config, address: &str) -> Result<Vec<Drc20Holding>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let balance_tree = db.open_tree("drc20_balance")?;
   let token_tree = db.open_tree("drc20_token_info")?;
@@ -3486,7 +3484,7 @@ pub fn list_drc20_holdings(config: &Config, address: &str) -> Result<Vec<Drc20Ho
 
 /// Looks up a single dogemap by block number. `None` means unclaimed.
 pub fn get_dogemap(config: &Config, number: u64) -> Result<Option<DogemapEntry>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let tree = db.open_tree("dogemap_by_number")?;
 
@@ -3504,7 +3502,7 @@ pub fn get_dogemap(config: &Config, number: u64) -> Result<Option<DogemapEntry>>
 /// authoritative by_number tree. The extra lookup is deliberate: it means a
 /// stale index key can never invent ownership, it can only be skipped.
 pub fn list_dogemaps_for_address(config: &Config, address: &str) -> Result<Vec<DogemapEntry>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let by_address = db.open_tree("dogemap_by_address")?;
   let by_number = db.open_tree("dogemap_by_number")?;
@@ -3547,7 +3545,7 @@ pub fn list_dogemaps_for_address(config: &Config, address: &str) -> Result<Vec<D
 /// pulled the whole tree through the block cache and spiked the process from
 /// 6 GB to 16 GB when served from an API handler.
 pub fn dogemap_count(config: &Config) -> Result<u64> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   db.open_tree("dogemap_by_number")?.approximate_len()
 }
@@ -3556,7 +3554,7 @@ pub fn dogemap_count(config: &Config) -> Result<u64> {
 /// cache it; `dogemap_count` is RocksDB's estimate and can run several percent
 /// high, enough to exceed the number of blocks that exist.
 pub fn dogemap_count_exact(config: &Config) -> Result<u64> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let mut n = 0u64;
   db.open_tree("dogemap_by_number")?.for_each_prefix(b"", |_, _| {
@@ -3567,7 +3565,7 @@ pub fn dogemap_count_exact(config: &Config) -> Result<u64> {
 }
 
 pub fn list_dune_holdings(config: &Config, address: &str) -> Result<Vec<DuneHolding>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let outpoints_by_address = db.open_tree("outpoints_by_address")?;
   let dune_balances_by_outpoint = db.open_tree("dune_balances_by_outpoint")?;
@@ -3610,7 +3608,7 @@ pub fn list_dune_holdings(config: &Config, address: &str) -> Result<Vec<DuneHold
 }
 
 pub fn list_dune_utxos(config: &Config, address: &str, dune_id: &str) -> Result<Vec<DuneUtxo>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let outpoints_by_address = db.open_tree("outpoints_by_address")?;
   let dune_balances_by_outpoint = db.open_tree("dune_balances_by_outpoint")?;
@@ -3654,7 +3652,7 @@ pub fn list_dune_utxos(config: &Config, address: &str, dune_id: &str) -> Result<
 /// second time by a process that already holds it.
 #[doc(hidden)]
 pub fn seed_rows(config: &Config, rows: &[(&str, Vec<u8>, Vec<u8>)]) -> Result<()> {
-  let db = open_db(&format!("{}/spookyord.rocksdb", config.data_dir))?;
+  let db = open_db(&config.db_path())?;
   for (tree, key, value) in rows {
     db.open_tree(tree)?.insert(key, value)?;
   }
@@ -3666,7 +3664,7 @@ pub fn seed_rows(config: &Config, rows: &[(&str, Vec<u8>, Vec<u8>)]) -> Result<(
 /// The explorer checks every transaction of a block at once, so this goes
 /// through multi_get rather than one point get per id.
 pub fn find_inscriptions(config: &Config, ids: &[String]) -> Result<Vec<InscriptionRecord>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let inscriptions_by_id = db.open_tree("inscriptions_by_id")?;
 
@@ -3691,7 +3689,7 @@ pub struct Drc20TokenSummary {
 
 /// Every deployed DRC-20 token. This is a full scan, so callers should cache.
 pub fn list_drc20_tokens(config: &Config) -> Result<Vec<Drc20TokenSummary>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let token_tree = db.open_tree("drc20_token_info")?;
 
@@ -3734,7 +3732,7 @@ pub struct DuneSummary {
 
 /// Every etched dune. This is a full scan, so callers should cache.
 pub fn list_dunes(config: &Config) -> Result<Vec<DuneSummary>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let dune_meta_by_id = db.open_tree("dune_meta_by_id")?;
   let dune_entry_by_id = db.open_tree("dune_entry_by_id")?;
@@ -3789,7 +3787,7 @@ pub struct Drc20Holders {
 /// result per tick. Holding every tick's list in memory instead would approach
 /// the size of the whole balance tree.
 pub fn drc20_holders(config: &Config, tick: &str, keep: usize) -> Result<Drc20Holders> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let balance_tree = db.open_tree("drc20_balance")?;
 
@@ -3862,7 +3860,7 @@ pub struct DuneHolderRow {
 /// One dune with its holders. Dune balances live on outputs, and few outputs
 /// hold any, so this walks the balance tree and resolves each output's owner.
 pub fn get_dune_detail(config: &Config, dune_id: &str) -> Result<Option<DuneDetail>> {
-  let db_path = format!("{}/spookyord.rocksdb", config.data_dir);
+  let db_path = config.db_path();
   let db = open_db(&db_path)?;
   let dune_meta_by_id = db.open_tree("dune_meta_by_id")?;
   let dune_entry_by_id = db.open_tree("dune_entry_by_id")?;
@@ -3938,7 +3936,7 @@ pub fn get_dune_detail(config: &Config, dune_id: &str) -> Result<Option<DuneDeta
 // ---- token detail: deploys, activity, holder counts, etchings ----
 
 pub fn get_drc20_deploy(config: &Config, tick: &str) -> Result<Option<Drc20Deploy>> {
-  let db = open_db(&format!("{}/spookyord.rocksdb", config.data_dir))?;
+  let db = open_db(&config.db_path())?;
   match db.open_tree("drc20_deploy")?.get(tick.as_bytes())? {
     Some(raw) => Ok(Some(bincode::deserialize(raw.as_ref())?)),
     None => Ok(None),
@@ -3947,7 +3945,7 @@ pub fn get_drc20_deploy(config: &Config, tick: &str) -> Result<Option<Drc20Deplo
 
 /// A page of a token's activity, newest first, and whether more follows.
 pub fn list_activity(config: &Config, scope: &str, offset: usize, limit: usize) -> Result<(Vec<ActivityEvent>, bool)> {
-  let db = open_db(&format!("{}/spookyord.rocksdb", config.data_dir))?;
+  let db = open_db(&config.db_path())?;
   let tree = db.open_tree("token_activity")?;
   let mut seen = 0usize;
   let mut out = Vec::new();
@@ -3969,7 +3967,7 @@ pub fn list_activity(config: &Config, scope: &str, offset: usize, limit: usize) 
 
 /// Holder count for every DRC-20 tick, in one pass over the balances.
 pub fn drc20_holder_counts(config: &Config) -> Result<HashMap<String, u32>> {
-  let db = open_db(&format!("{}/spookyord.rocksdb", config.data_dir))?;
+  let db = open_db(&config.db_path())?;
   let mut counts: HashMap<String, u32> = HashMap::new();
   db.open_tree("drc20_balance")?.for_each_prefix(b"B|", |_, v| {
     let bal: Drc20Balance = bincode::deserialize(v)?;
@@ -3983,7 +3981,7 @@ pub fn drc20_holder_counts(config: &Config) -> Result<HashMap<String, u32>> {
 
 /// Holder count for every dune: distinct owners of the outputs holding it.
 pub fn dune_holder_counts(config: &Config) -> Result<HashMap<String, u32>> {
-  let db = open_db(&format!("{}/spookyord.rocksdb", config.data_dir))?;
+  let db = open_db(&config.db_path())?;
   let balances = db.open_tree("dune_balances_by_outpoint")?;
   let utxos = db.open_tree("utxo_by_outpoint")?;
   let mut owners: HashMap<String, HashSet<String>> = HashMap::new();
@@ -4078,7 +4076,7 @@ const ACTIVITY_SINCE_KEY: &[u8] = b"activity_since";
 
 /// First block whose token activity was recorded, once recording has begun.
 pub fn activity_since(config: &Config) -> Result<Option<u64>> {
-  let db = open_db(&format!("{}/spookyord.rocksdb", config.data_dir))?;
+  let db = open_db(&config.db_path())?;
   match db.open_tree("meta")?.get(ACTIVITY_SINCE_KEY)? {
     Some(raw) => Ok(Some(decode_u64(raw.as_ref())?)),
     None => Ok(None),
@@ -4086,7 +4084,7 @@ pub fn activity_since(config: &Config) -> Result<Option<u64>> {
 }
 
 pub fn drc20_deploy_backfill_done(config: &Config) -> Result<bool> {
-  let db = open_db(&format!("{}/spookyord.rocksdb", config.data_dir))?;
+  let db = open_db(&config.db_path())?;
   Ok(db.open_tree("meta")?.get(DEPLOY_BACKFILL_KEY)?.is_some())
 }
 
@@ -4107,7 +4105,7 @@ pub async fn backfill_drc20_deploys(config: Config) -> Result<()> {
   let started = Instant::now();
   let scan_config = config.clone();
   let candidates = tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<String>>> {
-    let db = open_db(&format!("{}/spookyord.rocksdb", scan_config.data_dir))?;
+    let db = open_db(&scan_config.db_path())?;
     let content = db.open_tree("inscription_content")?;
     let tokens = db.open_tree("drc20_token_info")?;
     let deploys = db.open_tree("drc20_deploy")?;
@@ -4151,7 +4149,7 @@ pub async fn backfill_drc20_deploys(config: Config) -> Result<()> {
   .context("deploy scan task")??;
 
   let client = indexer_rpc_client()?;
-  let db = open_db(&format!("{}/spookyord.rocksdb", config.data_dir))?;
+  let db = open_db(&config.db_path())?;
   let deploys = db.open_tree("drc20_deploy")?;
   let mut headers: HashMap<String, (u64, u64)> = HashMap::new();
   let mut positions: HashMap<String, Vec<String>> = HashMap::new();
@@ -4253,7 +4251,7 @@ pub async fn node_rpc(config: &Config, method: &str, params: Value) -> Result<Va
 
   let req = JsonRpcRequest {
     jsonrpc: "1.0",
-    id: "spookyord-api",
+    id: "dogeord-api",
     method,
     params,
   };
@@ -4285,7 +4283,7 @@ async fn rpc_call<T: for<'de> Deserialize<'de>>(
     attempt += 1;
     let req = JsonRpcRequest {
       jsonrpc: "1.0",
-      id: "spookyord",
+      id: "dogeord",
       method,
       params: params.clone(),
     };
@@ -4360,10 +4358,9 @@ fn open_db(db_path: &str) -> Result<store::Db> {
   // process under one core - the store, not CPU, was the constraint. sled also
   // amplified ~1 MB of logical writes per block into ~16 MB on disk.
   //
-  // SPOOKY_SLED_CACHE_MB is still honoured as the sizing knob so existing
+  // DOGEORD_SLED_CACHE_MB (or SPOOKY_SLED_CACHE_MB) is still honoured as the sizing knob so existing
   // launch scripts keep working; it now sizes RocksDB write buffers.
-  let cache_mb: usize = std::env::var("SPOOKY_SLED_CACHE_MB")
-    .ok()
+  let cache_mb: usize = dogeord_core::setting("SLED_CACHE_MB")
     .and_then(|v| v.parse().ok())
     .filter(|v| *v > 0)
     .unwrap_or(4096);
@@ -4375,7 +4372,7 @@ fn open_db(db_path: &str) -> Result<store::Db> {
   // Filters live inside each SST, so existing files keep the old format until
   // rewritten; without this, point lookups against already-indexed data keep
   // scanning every file in every level.
-  if std::env::var("SPOOKY_COMPACT_ON_START").is_ok() {
+  if dogeord_core::setting("COMPACT_ON_START").is_some() {
     info!("compacting all column families to apply current table options (one-off, slow)");
     let t = std::time::Instant::now();
     db.compact_all()?;
@@ -5346,7 +5343,7 @@ mod tests {
   #[test]
   fn spendable_utxos_excludes_inscription_outpoints() {
     let uniq = format!(
-      "spookyord-test-{}",
+      "dogeord-test-{}",
       std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -5354,7 +5351,7 @@ mod tests {
     );
     let dir = std::env::temp_dir().join(uniq);
     std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("spookyord.rocksdb");
+    let db_path = dir.join(dogeord_core::DB_DIR);
     let db = store::Db::open(db_path.to_str().unwrap(), 64).unwrap();
     let outpoints = db.open_tree("outpoints_by_address").unwrap();
     let insc_by_outpoint = db.open_tree("inscriptions_by_outpoint").unwrap();
@@ -5443,7 +5440,7 @@ mod tests {
     // The launch-time race: the first opens of the shared store happen
     // concurrently (the indexer and the deploy backfill both open at start),
     // and every one of them must get the one handle, not a lock error.
-    let db_file = format!("{}/spookyord.rocksdb", cfg.data_dir);
+    let db_file = cfg.db_path();
     let openers: Vec<_> = (0..8).map(|_| { let p = db_file.clone(); std::thread::spawn(move || open_db(&p).map(|_| ())) }).collect();
     for o in openers {
       o.join().unwrap().expect("every concurrent first open succeeds");

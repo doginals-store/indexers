@@ -1,5 +1,5 @@
 [package]
-name = "spookyord-core"
+name = "dogeord-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

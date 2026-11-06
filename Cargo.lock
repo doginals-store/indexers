@@ -249,12 +249,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "dogeord-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "dogeord-indexer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "dogeord-core",
+ "hex",
+ "once_cell",
+ "rayon",
+ "reqwest",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "unicode-properties",
+ "unicode-script",
+]
+
+[[package]]
 name = "doginals-indexer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "spookyord-core",
- "spookyord-indexer",
+ "dogeord-core",
+ "dogeord-indexer",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1501,34 +1529,6 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "spookyord-core"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "spookyord-indexer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "hex",
- "once_cell",
- "rayon",
- "reqwest",
- "rocksdb",
- "serde",
- "serde_json",
- "sha2",
- "spookyord-core",
- "tokio",
- "tracing",
- "unicode-properties",
- "unicode-script",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [package]
-name = "spookyord-indexer"
+name = "dogeord-indexer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,4 +19,4 @@ once_cell.workspace = true
 unicode-script = "0.5"
 unicode-properties = "0.1"
 sha2 = "0.10"
-spookyord-core = { path = "../core" }
+dogeord-core = { path = "../core" }
