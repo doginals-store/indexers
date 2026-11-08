@@ -443,6 +443,62 @@ mod tests {
     let _ = std::fs::remove_dir_all(&scratch);
   }
 
+  #[test]
+  fn a_recovered_inscription_taken_out_by_mistake_goes_back_where_it_was() {
+    let db = store::Db::temporary().unwrap();
+    let config = Config { content_store: "full".into(), ..Config::from_env() };
+    let id = "ff".repeat(32) + "i0";
+    let f = Found {
+      id: id.clone(),
+      content_type: "model/gltf-binary".into(),
+      body: Vec::new(),
+      delegate: None,
+      height: 5_136_528,
+      tx_index: 12,
+      time: 1_710_891_608,
+      at: Some(("cb".repeat(32), 0, 0, 100_000, "DQLXWvQQR2McripmKwhXGaUoPGKLPsJdVD".into())),
+    };
+    db.open_tree("repair_found").unwrap().insert(id.as_bytes(), bincode::serialize(&f).unwrap()).unwrap();
+    db.open_tree("repair_body").unwrap().insert(id.as_bytes(), b"glTF".to_vec()).unwrap();
+    assert_eq!(recovered_place(&db, &id).unwrap(), Some(Some(("cb".repeat(32), 0))));
+    assert!(restore_recovered(&config, &db, &id).unwrap());
+    assert!(!restore_recovered(&config, &db, &id).unwrap(), "already back");
+    let rec: InscriptionRecord = bincode::deserialize(db.open_tree("inscriptions_by_id").unwrap().get(id.as_bytes()).unwrap().unwrap().as_ref()).unwrap();
+    assert_eq!((rec.txid.as_str(), rec.vout, rec.address.as_str()), ("cb".repeat(32).as_str(), 0, "DQLXWvQQR2McripmKwhXGaUoPGKLPsJdVD"));
+    let list: Vec<(u64, String)> =
+      bincode::deserialize(db.open_tree("inscriptions_by_outpoint").unwrap().get(outpoint_key(&"cb".repeat(32), 0).as_bytes()).unwrap().unwrap().as_ref()).unwrap();
+    assert_eq!(list, vec![(0, id.clone())]);
+    assert!(db.open_tree("inscriptions_by_address").unwrap().get(format!("DQLXWvQQR2McripmKwhXGaUoPGKLPsJdVD|{id}").as_bytes()).unwrap().is_some());
+    let row = db.open_tree("inscription_seq").unwrap().get(insc_index::seq_key(5_136_528, 12)).unwrap().unwrap();
+    assert_eq!(bincode::deserialize::<insc_index::SeqEntry>(row.as_ref()).unwrap().id, id);
+    let c = decode_inscription_content(db.open_tree("inscription_content").unwrap().get(id.as_bytes()).unwrap().unwrap().as_ref()).unwrap();
+    assert_eq!(c.body, b"glTF");
+    assert!(!restore_recovered(&config, &db, &("ee".repeat(32) + "i0")).unwrap(), "never recovered");
+  }
+
+  /// Prints what the repair kept for some ids (where it last placed each,
+  /// and its content length), read from the live index without stopping it.
+  /// Skipped by default: `DOGEORD_DB=<rocksdb dir> IDS=<id,id> cargo test
+  /// -p dogeord-indexer show_recovered -- --ignored --nocapture`
+  #[test]
+  #[ignore]
+  fn show_recovered() {
+    let db_path = std::env::var("DOGEORD_DB").expect("DOGEORD_DB");
+    let scratch = std::env::temp_dir().join(format!("dogeord-secondary-{}", std::process::id()));
+    let db = store::Db::open_secondary(&db_path, &scratch.to_string_lossy()).unwrap();
+    let found = db.open_tree("repair_found").unwrap();
+    let bodies = db.open_tree("repair_body").unwrap();
+    for id in std::env::var("IDS").expect("IDS").split(',') {
+      let f: Option<Found> = found.get(id.as_bytes()).unwrap().map(|v| bincode::deserialize(v.as_ref()).unwrap());
+      let body = bodies.get(id.as_bytes()).unwrap().map(|b| b.len());
+      match f {
+        Some(f) => println!("{id}: {} at height {} position {}, placed {:?}, body {body:?} bytes", f.content_type, f.height, f.tx_index, f.at),
+        None => println!("{id}: not in repair_found (body {body:?})"),
+      }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+  }
+
   /// The 10 inscriptions a JavaScript replay of the reference rule found
   /// missing from the live index in blocks 5,449,700 to 5,449,899, out of
   /// 77,263 reveal chains completed there. Against the node; skipped by
@@ -492,23 +548,63 @@ mod tests {
 /// progress. Called with the live indexer's write lock held.
 fn apply(config: &Config, db: &store::Db, found: &HashMap<String, Found>, bodies: &store::Tree, scratch_partial: &store::Tree) -> Result<()> {
   let by_id = db.open_tree("inscriptions_by_id")?;
-  let by_outpoint = db.open_tree("inscriptions_by_outpoint")?;
-  let by_address = db.open_tree("inscriptions_by_address")?;
-  let content = db.open_tree("inscription_content")?;
-  let seq = db.open_tree("inscription_seq")?;
   let partial = db.open_tree("partial_inscription_chain")?;
   for f in found.values() {
     if by_id.get(f.id.as_bytes())?.is_some() {
       continue;
     }
     let body = bodies.get(f.id.as_bytes())?.map(|b| b.to_vec()).unwrap_or_default();
+    add_found(config, db, f, &body)?;
+  }
+  // Chains still being revealed that the live indexer had dropped.
+  scratch_partial.for_each_prefix(b"", |k, v| {
+    if partial.get(k)?.is_none() {
+      partial.insert(k, v)?;
+    }
+    Ok(true)
+  })?;
+  Ok(())
+}
+
+/// Where the repair last placed a recovered inscription: Some(None) when it
+/// went to fees, None when the repair never recovered it.
+pub(crate) fn recovered_place(db: &store::Db, id: &str) -> Result<Option<Option<(String, u32)>>> {
+  let Some(raw) = db.open_tree("repair_found")?.get(id.as_bytes())? else { return Ok(None) };
+  let f: Found = bincode::deserialize(raw.as_ref()).context("decode repair_found")?;
+  Ok(Some(f.at.map(|(txid, vout, ..)| (txid, vout))))
+}
+
+/// Puts back an inscription the repair recovered that was later taken out
+/// by mistake, where the repair last placed it (the caller checks that
+/// output is still unspent), in chain order where it completes. Returns
+/// false when the repair never recovered it or it is already there.
+pub(crate) fn restore_recovered(config: &Config, db: &store::Db, id: &str) -> Result<bool> {
+  let Some(raw) = db.open_tree("repair_found")?.get(id.as_bytes())? else { return Ok(false) };
+  if db.open_tree("inscriptions_by_id")?.get(id.as_bytes())?.is_some() {
+    return Ok(false);
+  }
+  let f: Found = bincode::deserialize(raw.as_ref()).context("decode repair_found")?;
+  let body = db.open_tree("repair_body")?.get(id.as_bytes())?.map(|b| b.to_vec()).ok_or_else(|| anyhow!("{id}: the repair kept no content"))?;
+  add_found(config, db, &f, &body)?;
+  Ok(true)
+}
+
+/// Adds one recovered inscription to the live tables: content, place in
+/// chain order, and where it sits now.
+fn add_found(config: &Config, db: &store::Db, f: &Found, body: &[u8]) -> Result<()> {
+  let by_id = db.open_tree("inscriptions_by_id")?;
+  let by_outpoint = db.open_tree("inscriptions_by_outpoint")?;
+  let by_address = db.open_tree("inscriptions_by_address")?;
+  let content = db.open_tree("inscription_content")?;
+  let seq = db.open_tree("inscription_seq")?;
+  {
     if config.content_store == "full" {
-      let rec = InscriptionContentRecord { content_type: f.content_type.clone(), body: body.clone(), delegate: f.delegate.clone() };
+      let rec = InscriptionContentRecord { content_type: f.content_type.clone(), body: body.to_vec(), delegate: f.delegate.clone() };
       content.insert(f.id.as_bytes(), bincode::serialize(&rec)?)?;
     }
     let key = insc_index::seq_key(f.height, f.tx_index);
     if seq.get(key)?.is_none() {
-      let kinds = insc_index::kinds_for_new(&by_id, &f.content_type, &body, f.delegate.as_deref())?;
+      let kinds = insc_index::kinds_for_new(&by_id, &f.content_type, body, f.delegate.as_deref())?;
       seq.insert(key, insc_index::seq_value(&f.id, kinds, f.time)?)?;
     }
     match &f.at {
@@ -553,12 +649,5 @@ fn apply(config: &Config, db: &store::Db, found: &HashMap<String, Found>, bodies
       }
     }
   }
-  // Chains still being revealed that the live indexer had dropped.
-  scratch_partial.for_each_prefix(b"", |k, v| {
-    if partial.get(k)?.is_none() {
-      partial.insert(k, v)?;
-    }
-    Ok(true)
-  })?;
   Ok(())
 }

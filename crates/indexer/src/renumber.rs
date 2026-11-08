@@ -29,6 +29,9 @@ use crate::store::Batch;
 use std::io::BufRead;
 
 const DONE_KEY: &[u8] = b"inscription_renumber_v1";
+/// The second correction (see `run_fix`).
+const FIX_DIR: &str = "renumber2";
+const FIX_DONE_KEY: &[u8] = b"inscription_renumber_fix_v2";
 
 fn lines(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
   let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -84,11 +87,24 @@ pub(crate) fn remove_inscriptions(db: &store::Db, rows: &[(String, u64, u32)]) -
       batch.remove(&by_id, id.as_bytes().to_vec());
       batch.remove(&content, id.as_bytes().to_vec());
       batch.remove(&genesis, id.as_bytes().to_vec());
+      // Its place in chain order: where the plan says, else wherever it is
+      // in that block, so no row is left behind to be numbered.
       let key = ii::seq_key(*height, *tx_index);
       if let Some(v) = seq.get(key)?
         && bincode::deserialize::<SeqEntry>(v.as_ref()).is_ok_and(|e| &e.id == id)
       {
         batch.remove(&seq, key.to_vec());
+      } else {
+        let mut stray = Vec::new();
+        seq.for_each_prefix(height.to_be_bytes(), |k, v| {
+          if bincode::deserialize::<SeqEntry>(v).is_ok_and(|e| &e.id == id) {
+            stray.push(k.to_vec());
+          }
+          Ok(true)
+        })?;
+        for k in stray {
+          batch.remove(&seq, k);
+        }
       }
       removed += 1;
     }
@@ -260,15 +276,103 @@ pub(crate) fn rebuild_dogemaps(db: &store::Db) -> Result<u64> {
   Ok(claims.len() as u64)
 }
 
+/// Whether the archive correction is complete: the renumber has run, and no
+/// later fix plan is waiting.
 pub fn renumber_done(config: &Config) -> Result<bool> {
-  Ok(open_db(&config.db_path())?.open_tree("meta")?.get(DONE_KEY)?.is_some())
+  let meta = open_db(&config.db_path())?.open_tree("meta")?;
+  Ok(meta.get(DONE_KEY)?.is_some() && !fix_pending(config, &meta)?)
+}
+
+fn fix_dir(config: &Config) -> std::path::PathBuf {
+  std::path::Path::new(&config.data_dir).join(FIX_DIR)
+}
+
+fn fix_pending(config: &Config, meta: &store::Tree) -> Result<bool> {
+  Ok(fix_dir(config).join("remove.tsv").exists() && meta.get(FIX_DONE_KEY)?.is_none())
 }
 
 /// The one-off correction and renumber; see the module notes. Does nothing
-/// once done, or when there is no plan in the data directory.
+/// once done, or when there is no plan in the data directory. Then the fix
+/// plan, if one is waiting.
 pub async fn run_renumber(config: Config) -> Result<()> {
+  run_first(config.clone()).await?;
+  let meta = open_db(&config.db_path())?.open_tree("meta")?;
+  if meta.get(DONE_KEY)?.is_some() && fix_pending(&config, &meta)? {
+    run_fix(config).await?;
+  }
+  Ok(())
+}
+
+/// The second correction, found by checking numbers against doggy.market
+/// (an ord-dogecoin index): `renumber2/` in the data directory holds
+///
+///  - `remove.tsv`: id, height, position. Inscriptions the live indexer made
+///    while the inscription already on that sat was missing from the index
+///    (the repair put it back later). ord-dogecoin makes no inscription where
+///    one already sits at offset 0, so these go.
+///  - `restore.tsv`: id. Inscriptions the repair recovered that the first
+///    correction took out by mistake: they go back where the repair placed
+///    them, which must still be unspent.
+///
+/// Then numbers and DNS are cleared, as by the renumber. Neither list holds
+/// a dogemap claim, so dogemaps stay as they are.
+async fn run_fix(config: Config) -> Result<()> {
+  let dir = fix_dir(&config);
+  let remove: Vec<(String, u64, u32)> = lines(&dir.join("remove.tsv"))?
+    .iter()
+    .map(|r| Ok((r[0].clone(), num(r, 1)?, num(r, 2)?)))
+    .collect::<Result<_>>()?;
+  let restore: Vec<String> = if dir.join("restore.tsv").exists() {
+    lines(&dir.join("restore.tsv"))?.into_iter().map(|r| r[0].clone()).collect()
+  } else {
+    Vec::new()
+  };
+  info!("renumber fix: plan read: {} inscriptions to remove, {} to restore", remove.len(), restore.len());
+  // Each one restored must still sit where the repair placed it.
+  let db = open_db(&config.db_path())?;
+  let client = indexer_rpc_client()?;
+  for id in &restore {
+    match repair::recovered_place(&db, id)? {
+      None => bail!("renumber fix: {id} was never recovered by the repair, so there is nothing to restore"),
+      Some(None) => {}
+      Some(Some((txid, vout))) => {
+        let out: Option<serde_json::Value> = rpc_call(client, &config, "gettxout", serde_json::json!([txid, vout, false])).await?;
+        if out.is_none() {
+          bail!("renumber fix: {id} was at {txid}:{vout}, which has been spent since; where it is now is not known");
+        }
+      }
+    }
+  }
+  let cfg = config.clone();
+  tokio::task::spawn_blocking(move || -> Result<()> {
+    let db = open_db(&cfg.db_path())?;
+    let started = Instant::now();
+    {
+      let _w = repair::INDEX_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+      let removed = remove_inscriptions(&db, &remove)?;
+      let mut restored = 0u64;
+      for id in &restore {
+        restored += repair::restore_recovered(&cfg, &db, id)? as u64;
+      }
+      info!("renumber fix: removed {removed}, restored {restored} ({:.0?})", started.elapsed());
+    }
+    ii::reset_numbering(&db)?;
+    dns::reset(&db)?;
+    let meta = db.open_tree("meta")?;
+    meta.insert(FIX_DONE_KEY, encode_u64(1).to_vec())?;
+    db.flush()?;
+    info!("renumber fix: numbers and DNS cleared; numbering starts again from the first inscription ({:.0?})", started.elapsed());
+    Ok(())
+  })
+  .await
+  .context("renumber fix task")??;
+  Ok(())
+}
+
+async fn run_first(config: Config) -> Result<()> {
   let dir = std::path::Path::new(&config.data_dir).join("renumber");
-  if renumber_done(&config)? || !dir.join("remove.tsv").exists() || !dir.join("multi.tsv").exists() {
+  let done = open_db(&config.db_path())?.open_tree("meta")?.get(DONE_KEY)?.is_some();
+  if done || !dir.join("remove.tsv").exists() || !dir.join("multi.tsv").exists() {
     return Ok(());
   }
   let remove: Vec<(String, u64, u32)> = lines(&dir.join("remove.tsv"))?
@@ -353,6 +457,21 @@ mod tests {
     let list: Vec<(u64, String)> = bincode::deserialize(by_outpoint.get("cc:0").unwrap().unwrap().as_ref()).unwrap();
     assert_eq!(list, vec![(0, old.clone())]);
     assert!(seq.get(ii::seq_key(100, 4)).unwrap().is_none() && seq.get(ii::seq_key(100, 5)).unwrap().is_some());
+  }
+
+  #[test]
+  fn removal_finds_its_place_in_chain_order_anywhere_in_the_block() {
+    let db = store::Db::temporary().unwrap();
+    let by_id = db.open_tree("inscriptions_by_id").unwrap();
+    let seq = db.open_tree("inscription_seq").unwrap();
+    let (bad, other) = ("bb".repeat(32) + "i0", "cc".repeat(32) + "i0");
+    by_id.insert(bad.as_bytes(), bincode::serialize(&rec(&bad, "dd", 0, "D")).unwrap()).unwrap();
+    // The plan says position 4, but its row is at 9 (as after a move).
+    seq.insert(ii::seq_key(100, 4), ii::seq_value(&other, 0, 1).unwrap()).unwrap();
+    seq.insert(ii::seq_key(100, 9), ii::seq_value(&bad, 0, 1).unwrap()).unwrap();
+    assert_eq!(remove_inscriptions(&db, &[(bad.clone(), 100, 4)]).unwrap(), 1);
+    assert!(seq.get(ii::seq_key(100, 9)).unwrap().is_none(), "no row left to be numbered");
+    assert!(seq.get(ii::seq_key(100, 4)).unwrap().is_some(), "another inscription's row stays");
   }
 
   #[test]
