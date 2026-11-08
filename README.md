@@ -11,6 +11,7 @@ The indexers of DogeOrd, the Dogecoin indexer behind [The Doginals Explorer](htt
 | Dunes | Etchings, mints and transfers; balances and UTXOs per address; activity per dune. |
 | Dogemaps | `N.dogemap` claims, first come first served. |
 | DNS names | Dogecoin Names System names (`label.namespace`), registered as plain text or as JSON, following [spec v1.2](https://github.com/jonheaven/dns). The first valid inscription of a name owns it, and the name moves with that inscription. Records and chosen names only count when they come from the holder at the time, which is checked against the node. |
+| D:// (DogeFeed) | Posts, comments, quotes, edits and key links (signed JSON inscriptions) and likes, branches, follows, tips, reveals, deletes and key revocations (payments with a signed 80-byte OP_RETURN), from block 6,440,000. Every signature and payout is checked with the `dproto` crate; invalid records are kept with the reason. A standalone version is at [doginals-store/dogefeed-indexer](https://github.com/doginals-store/dogefeed-indexer). |
 
 The DNS index reads inscriptions in the numbered order, so it starts once inscription numbering has caught up.
 

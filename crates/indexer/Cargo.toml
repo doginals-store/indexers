@@ -20,3 +20,4 @@ unicode-script = "0.5"
 unicode-properties = "0.1"
 sha2 = "0.10"
 dogeord-core = { path = "../core" }
+dproto = { path = "../dproto" }

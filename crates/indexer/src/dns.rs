@@ -7,16 +7,19 @@
 //!
 //! A separate indexer with its own trees and its own task. It reads nothing
 //! from blocks: it follows `inscription_seq` in chain order, only as far as
-//! inscription numbering has gone, which is [`NUMBER_CONFIRMATIONS`] blocks
-//! deep. So:
+//! inscription numbering has gone, which is [`DNS_CONFIRMATIONS`]
+//! confirmation: names appear with the block that makes them. So:
 //!
 //!  - first come, first served is decided in exact chain order (height, then
 //!    position in block), the order the spec requires, and every write of a
 //!    step is seen by the rows after it;
-//!  - a reorg never has to take a name back, because rows that shallow are
-//!    never read;
 //!  - each step is one atomic batch with its cursor, so a crash cannot apply
-//!    anything twice.
+//!    anything twice;
+//!  - each step near the tip also saves what its batch overwrote
+//!    (`dns_undo`). A reorg ([`undo_from`], called by the rollback) puts those
+//!    back, newest step first, which also moves the cursor back, and the
+//!    replacing blocks are read again. As ord does with its savepoints, only
+//!    so deep: [`UNDO_BLOCKS`].
 //!
 //! Three kinds of inscription matter:
 //!
@@ -35,7 +38,33 @@
 //! same first-in-first-out rule the main indexer moves inscriptions by.
 
 use super::*;
-use crate::insc_index::{self as ii, NUMBER_CONFIRMATIONS, SeqEntry};
+use crate::insc_index::{self as ii, SeqEntry};
+
+/// Confirmations a block needs before its names are read: 1 means as soon as
+/// it is indexed and numbered.
+pub const DNS_CONFIRMATIONS: u64 = 1;
+
+/// How many blocks back a reorg can be undone. Steps applied further from the
+/// tip than this keep no undo record.
+pub const UNDO_BLOCKS: u64 = 100;
+
+/// Held while a step commits and while a reorg undoes steps.
+static DNS_WRITE: Mutex<()> = Mutex::new(());
+
+/// Meta key of a counter bumped by every reorg undo, so a step read before it
+/// is never committed after it, and the task reloads its state.
+const REORG_GEN_KEY: &[u8] = b"dns_reorg_gen";
+
+fn reorg_gen(meta: &Tree) -> Result<u64> {
+  Ok(ii::meta_u64(meta, REORG_GEN_KEY)?.unwrap_or(0))
+}
+
+/// What one step overwrote: tree, key, previous value (None: it was absent).
+#[derive(Serialize, Deserialize)]
+struct DnsUndo {
+  last_height: u64,
+  ops: Vec<(String, Vec<u8>, Option<Vec<u8>>)>,
+}
 use crate::store::{Batch, Tree};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -674,6 +703,7 @@ struct Trees {
   configs: Tree,
   primary: Tree,
   stats: Tree,
+  undo: Tree,
 }
 
 impl Trees {
@@ -692,6 +722,7 @@ impl Trees {
       configs: db.open_tree("dns_config")?,
       primary: db.open_tree("dns_primary")?,
       stats: db.open_tree("dns_stats")?,
+      undo: db.open_tree("dns_undo")?,
     })
   }
 }
@@ -969,7 +1000,17 @@ struct Candidate {
 /// Reads the next stretch of chain order, up to what has been numbered, and
 /// returns the DNS operations in it plus the last key read.
 fn scan(t: &Trees, st: &DnsState, max: usize) -> Result<(Vec<Candidate>, Option<Vec<u8>>, u64)> {
-  let numbered_through = ii::numbering_state(&t.meta)?.cursor;
+  // As far as numbering has gone, and no closer to the tip than
+  // DNS_CONFIRMATIONS allows.
+  let mut numbered_through = ii::numbering_state(&t.meta)?.cursor;
+  let indexed = ii::meta_u64(&t.meta, b"indexed_height")?.unwrap_or(0);
+  let Some(settled) = (indexed + 1).checked_sub(DNS_CONFIRMATIONS) else {
+    return Ok((Vec::new(), None, 0));
+  };
+  let settled_key = ii::seq_key(settled, u32::MAX).to_vec();
+  if numbered_through > settled_key {
+    numbered_through = settled_key;
+  }
   if numbered_through.is_empty() || st.cursor.as_slice() >= numbered_through.as_slice() {
     return Ok((Vec::new(), None, 0));
   }
@@ -1034,6 +1075,7 @@ async fn apply(
   last: Vec<u8>,
   scanned: u64,
   lenient: bool,
+  era: u64,
 ) -> Result<DnsState> {
   let mut batch = Batch::default();
   // Writes of this stretch that later rows of it must see.
@@ -1267,11 +1309,83 @@ async fn apply(
     batch.insert(&t.by_inscription, c.id.as_bytes().to_vec(), bincode::serialize(&r)?);
   }
   st.cursor_height = ii::seq_height(&last);
-  st.cursor = last;
+  st.cursor = last.clone();
   st.scanned += scanned;
   batch.insert(&t.meta, DNS_STATE_KEY.to_vec(), bincode::serialize(&st)?);
+
+  let indexed = ii::meta_u64(&t.meta, b"indexed_height")?.unwrap_or(0);
+  let _w = DNS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+  if reorg_gen(&t.meta)? != era {
+    bail!("{REORGED}");
+  }
+  if st.cursor_height + UNDO_BLOCKS >= indexed {
+    let ops = batch.previous(&t.meta)?;
+    batch.insert(&t.undo, last, bincode::serialize(&DnsUndo { last_height: st.cursor_height, ops })?);
+  }
+  // Undo records too deep to be used again.
+  let floor = ii::seq_key(indexed.saturating_sub(UNDO_BLOCKS), 0);
+  t.undo.for_each_from(b"", |k, _| {
+    if k >= floor.as_slice() {
+      return Ok(false);
+    }
+    batch.remove(&t.undo, k.to_vec());
+    Ok(true)
+  })?;
   batch.commit(&t.meta)?;
   Ok(st)
+}
+
+/// Clears the whole DNS index, so it is read again from the first numbered
+/// inscription. The running task notices (as after a reorg) and starts over.
+pub(crate) fn reset(db: &store::Db) -> Result<()> {
+  let _w = DNS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+  for tree in [
+    "dns_name", "dns_by_inscription", "dns_index", "dns_ns_index", "dns_claims", "dns_config", "dns_primary", "dns_stats", "dns_undo",
+  ] {
+    // Keys are UTF-8 names, big-endian numbers and seq keys: all below this.
+    db.open_tree(tree)?.delete_range(Vec::new(), vec![0xff; 64])?;
+  }
+  let meta = db.open_tree("meta")?;
+  meta.remove(DNS_STATE_KEY)?;
+  meta.insert(REORG_GEN_KEY, encode_u64(reorg_gen(&meta)? + 1).to_vec())?;
+  Ok(())
+}
+
+/// The error a step returns when a reorg came between reading and writing it.
+const REORGED: &str = "a reorg changed the chain under this stretch";
+
+/// Undoes every DNS step that read blocks at `height` and above, newest
+/// first, each as one batch. Called by a reorg's rollback.
+pub(crate) fn undo_from(db: &store::Db, height: u64) -> Result<()> {
+  let _w = DNS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+  let meta = db.open_tree("meta")?;
+  meta.insert(REORG_GEN_KEY, encode_u64(reorg_gen(&meta)? + 1).to_vec())?;
+  let undo = db.open_tree("dns_undo")?;
+  let st = dns_state(&meta)?;
+  if st.cursor.is_empty() || st.cursor_height < height {
+    return Ok(());
+  }
+  let mut steps: Vec<(Vec<u8>, DnsUndo)> = Vec::new();
+  undo.for_each_from(&ii::seq_key(height, 0), |k, v| {
+    steps.push((k.to_vec(), bincode::deserialize(v).context("decode dns undo")?));
+    Ok(true)
+  })?;
+  let undone = steps.len();
+  for (key, step) in steps.into_iter().rev() {
+    let mut batch = Batch::default();
+    for (tree, k, previous) in step.ops {
+      batch.put_raw(tree, k, previous);
+    }
+    batch.remove(&undo, key);
+    batch.commit(&meta)?;
+  }
+  let st = dns_state(&meta)?;
+  if !st.cursor.is_empty() && st.cursor_height >= height {
+    warn!("dns index: the reorg at block {height} is deeper than its undo history; names from block {height} on may be wrong");
+  } else {
+    warn!("dns index: reorg at block {height}: undid {undone} steps, reading again from block {}", st.cursor_height);
+  }
+  Ok(())
 }
 
 /// The DNS indexer: catches up over every numbered inscription, then follows
@@ -1282,7 +1396,14 @@ pub async fn run_dns_index(config: Config) -> Result<()> {
   let mut st = dns_state(&t.meta)?;
   info!("dns index: starting at block {}, {} names so far", st.cursor_height, st.names);
   let (mut last_log, mut caught_up, mut failures) = (Instant::now(), false, 0u32);
+  let mut seen_era = reorg_gen(&t.meta)?;
   loop {
+    // A reorg undid steps: start again from what is stored.
+    let era = reorg_gen(&t.meta)?;
+    if era != seen_era {
+      seen_era = era;
+      st = dns_state(&t.meta)?;
+    }
     let (t2, st2) = (t.clone(), st.clone());
     let (cands, last, scanned) = tokio::task::spawn_blocking(move || scan(&t2, &st2, 200_000)).await.context("dns scan")??;
     let Some(last) = last else {
@@ -1294,15 +1415,16 @@ pub async fn run_dns_index(config: Config) -> Result<()> {
           info!("dns index: caught up at block {}, {} names, {} missed claims, {} configs", st.cursor_height, st.names, st.claims, st.configs);
         }
       }
-      sleep(Duration::from_secs(15)).await;
+      sleep(Duration::from_secs(2)).await;
       continue;
     };
     // A failed stretch writes nothing, so it is simply read again.
-    match apply(&config, &t, st.clone(), cands, last, scanned, failures >= 3).await {
+    match apply(&config, &t, st.clone(), cands, last, scanned, failures >= 3, era).await {
       Ok(next) => {
         st = next;
         failures = 0;
       }
+      Err(_) if reorg_gen(&t.meta).unwrap_or(era) != era => continue,
       Err(e) => {
         failures += 1;
         warn!("dns index: stretch after block {} failed (try {failures}): {e:#}", st.cursor_height);
@@ -1340,8 +1462,20 @@ pub fn dns_status(config: &Config) -> Result<DnsStatus> {
   let numbered = ii::numbering_state(&meta)?.cursor;
   let backfilled = ii::inscription_seq_backfill_done(config)?;
   let indexed = ii::meta_u64(&meta, b"indexed_height")?.unwrap_or(0);
-  // Within a few blocks of the buried tip that numbering follows.
-  let caught_up = backfilled && !numbered.is_empty() && st.cursor >= numbered && st.cursor_height + NUMBER_CONFIRMATIONS + 3 >= indexed;
+  // Read up to what it may read (numbered and settled), and within a few
+  // blocks of the settled tip.
+  let settled = ii::seq_key((indexed + 1).saturating_sub(DNS_CONFIRMATIONS), u32::MAX).to_vec();
+  let readable = if numbered > settled { settled } else { numbered.clone() };
+  let mut start = st.cursor.clone();
+  if !start.is_empty() {
+    start.push(0);
+  }
+  let mut unread = false;
+  db.open_tree("inscription_seq")?.for_each_from(&start, |k, _| {
+    unread = k <= readable.as_slice();
+    Ok(false)
+  })?;
+  let caught_up = backfilled && !numbered.is_empty() && !unread && st.cursor_height + DNS_CONFIRMATIONS + 3 >= indexed;
   Ok(DnsStatus {
     caught_up,
     height: st.cursor_height,
@@ -1932,6 +2066,9 @@ mod tests {
       kind_next: Vec<u64>,
     }
     meta.insert(b"inscription_numbering_v1", bincode::serialize(&Numbering { cursor, next: rows.len() as u64, kind_next: vec![0; 15] }).unwrap()).unwrap();
+    // The tip far enough past the last row for DNS to read it.
+    let top = rows.iter().map(|r| r.0).max().unwrap_or(0);
+    meta.insert(b"indexed_height", encode_u64(top + DNS_CONFIRMATIONS).to_vec()).unwrap();
   }
 
   fn txid(n: u8) -> String {
@@ -1970,7 +2107,7 @@ mod tests {
     let mut st = dns_state(&t.meta).unwrap();
     for _ in 0..2 {
       let (c, last, scanned) = scan(&t, &st, 6).unwrap();
-      st = apply(&config, &t, st, c, last.unwrap(), scanned, false).await.unwrap();
+      st = apply(&config, &t, st, c, last.unwrap(), scanned, false, reorg_gen(&t.meta).unwrap()).await.unwrap();
     }
     assert!(scan(&t, &st, 6).unwrap().1.is_none(), "all read");
 
@@ -2037,7 +2174,7 @@ mod tests {
     let config = Config::from_env();
     let mut st = dns_state(&t.meta).unwrap();
     while let (c, Some(last), scanned) = scan(&t, &st, 4).unwrap() {
-      st = apply(&config, &t, st, c, last, scanned, false).await.unwrap();
+      st = apply(&config, &t, st, c, last, scanned, false, reorg_gen(&t.meta).unwrap()).await.unwrap();
     }
     assert_eq!((st.names, st.claims), (10, 5));
     for ns in ["dogecoin", "doginals", "dogefeed", "pup", "shib"] {
@@ -2050,5 +2187,63 @@ mod tests {
     }
     assert_eq!(featured_counts(&t.stats).unwrap().iter().map(|(n, c)| (n.as_str(), *c)).collect::<Vec<_>>(),
       vec![("doge", 0), ("dogecoin", 2), ("doginals", 2), ("dogefeed", 2), ("pup", 2), ("shib", 2)]);
+  }
+
+  #[tokio::test]
+  async fn a_reorg_undoes_the_names_of_the_blocks_it_removes() {
+    let db = store::Db::temporary().unwrap();
+    let t = Trees::open(&db).unwrap();
+    let config = Config::from_env();
+    let id = |n: u8| format!("{}i0", txid(n));
+    let (a, b) = ("DBckmbhKFCdFKC5LX8NtMUG5FPZvL5wLHR", "DH5yaieqoZN36fDVciNyRueRGvGLR3mr7L");
+    let step = |st: DnsState| {
+      let t = &t;
+      let config = &config;
+      async move {
+        let (c, last, scanned) = scan(t, &st, 100).unwrap();
+        apply(config, t, st, c, last.expect("rows to read"), scanned, false, reorg_gen(&t.meta).unwrap()).await.unwrap()
+      }
+    };
+
+    // Block 100 makes jon.doge; block 101, the tip, makes amy.doge and a late jon.doge.
+    let (r1, r2, r3) = (id(1), id(2), id(3));
+    seed_seq(&db, &[(100, 0, &r1, a, "text/plain", "jon.doge")]);
+    let st = step(dns_state(&t.meta).unwrap()).await;
+    seed_seq(&db, &[(100, 0, &r1, a, "text/plain", "jon.doge"), (101, 0, &r2, b, "text/plain", "amy.doge"), (101, 1, &r3, b, "text/plain", "jon.doge")]);
+    t.meta.insert(b"indexed_height", encode_u64(101).to_vec()).unwrap();
+    let st = step(st).await;
+    assert_eq!((st.names, st.claims, st.cursor_height), (2, 1, 101), "read at 1 confirmation");
+    assert_eq!(get_name(&t.name, "jon.doge").unwrap().unwrap().lost, 1);
+
+    // Block 101 is replaced: its rows go, then the rollback undoes DNS.
+    t.seq.remove(ii::seq_key(101, 0)).unwrap();
+    t.seq.remove(ii::seq_key(101, 1)).unwrap();
+    let era = reorg_gen(&t.meta).unwrap();
+    undo_from(&db, 101).unwrap();
+    assert_eq!(reorg_gen(&t.meta).unwrap(), era + 1);
+    let st = dns_state(&t.meta).unwrap();
+    assert_eq!((st.names, st.claims, st.cursor_height), (1, 0, 100));
+    assert!(get_name(&t.name, "amy.doge").unwrap().is_none());
+    assert_eq!(get_name(&t.name, "jon.doge").unwrap().unwrap().lost, 0, "the late claim is gone too");
+    assert!(t.by_inscription.get(r2.as_bytes()).unwrap().is_none() && t.by_inscription.get(r1.as_bytes()).unwrap().is_some());
+    assert_eq!(featured_counts(&t.stats).unwrap()[0], ("doge".to_string(), 1));
+
+    // A step read before the reorg is refused, not committed.
+    let stale = apply(&config, &t, st.clone(), Vec::new(), ii::seq_key(101, 9).to_vec(), 0, false, era).await;
+    assert!(stale.unwrap_err().to_string().contains(REORGED));
+
+    // The new block 101 gives amy.doge to someone else.
+    let r4 = id(4);
+    seed_seq(&db, &[(100, 0, &r1, a, "text/plain", "jon.doge"), (101, 2, &r4, a, "text/plain", "amy.doge")]);
+    t.meta.insert(b"indexed_height", encode_u64(101).to_vec()).unwrap();
+    let st = step(st).await;
+    assert_eq!((st.names, st.claims), (2, 0));
+    assert_eq!(get_name(&t.name, "amy.doge").unwrap().unwrap().inscription_id, r4);
+
+    // Undoing everything goes back to an empty index.
+    undo_from(&db, 100).unwrap();
+    let st = dns_state(&t.meta).unwrap();
+    assert!(st.cursor.is_empty() && st.names == 0);
+    assert!(get_name(&t.name, "jon.doge").unwrap().is_none());
   }
 }

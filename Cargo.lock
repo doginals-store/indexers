@@ -77,6 +77,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoin_hashes"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446819536d8121575eeb7e89efdbadb3f055e87e4bb66c6679a6d5cc2f4b64fd"
+dependencies = [
+ "hex-conservative",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -262,6 +271,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "dogeord-core",
+ "dproto",
  "hex",
  "once_cell",
  "rayon",
@@ -286,6 +296,18 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dproto"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "hex",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -507,6 +529,12 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hex-conservative"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "212ab92002354b4819390025006c897e8140934349e8635c9b077f47b4dcbd20"
 
 [[package]]
 name = "http"
@@ -1388,6 +1416,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "891d81b926048e76efe18581bf793546b4c0eaf8448d72be8de2bbee5fd166e1"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "secp256k1"
+version = "0.28.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d24b59d129cdadea20aea4fb2352fa053712e5d713eee47d700cd4b2bc002f10"
+dependencies = [
+ "bitcoin_hashes",
+ "secp256k1-sys",
+]
+
+[[package]]
+name = "secp256k1-sys"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5d1746aae42c19d583c3c1a8c646bfad910498e2051c551a7f2e3c0c9fbb7eb"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

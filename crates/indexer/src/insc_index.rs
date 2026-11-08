@@ -8,10 +8,12 @@
 //!    Blocks indexed before this existed are filled in once by
 //!    [`backfill_inscription_seq`], from the node's block lists.
 //!  - [`run_inscription_numbering`] walks `inscription_seq` in chain order and
-//!    gives each inscription its number, overall and within each kind. It only
-//!    numbers blocks [`NUMBER_CONFIRMATIONS`] deep, so a reorg never has to take
-//!    a number back, and it writes each step as one atomic batch together with
-//!    its cursor, so a crash cannot number anything twice.
+//!    gives each inscription its number, overall and within each kind, as soon
+//!    as its block has [`NUMBER_CONFIRMATIONS`] confirmation. A reorg takes the
+//!    numbers of the blocks it removes back ([`unnumber_from`], called by the
+//!    rollback), and they go to whatever the new blocks hold. Each step is one
+//!    atomic batch together with its cursor, so a crash cannot number anything
+//!    twice.
 //!  - The readers page by number, so page 10,000 costs the same as page 1.
 //!
 //! Ids are always `<txid>i0` here: the genesis transaction (for a multi-part
@@ -20,8 +22,13 @@
 use super::*;
 use crate::store::{Batch, Tree};
 
-/// Blocks a height must be buried under before its inscriptions are numbered.
-pub const NUMBER_CONFIRMATIONS: u64 = 6;
+/// Confirmations a block needs before its inscriptions are numbered: 1 means
+/// as soon as the block is indexed.
+pub const NUMBER_CONFIRMATIONS: u64 = 1;
+
+/// Held while numbers are given or taken back, so a reorg's rollback and the
+/// numbering task never interleave.
+static NUMBER_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Content kinds, as bit positions. An inscription can be in more than one:
 /// a GIF is also an image.
@@ -43,8 +50,8 @@ const K_MODEL: u32 = 1 << 9;
 const K_PDF: u32 = 1 << 10;
 const K_FONT: u32 = 1 << 11;
 const K_DRC20: u32 = 1 << 12;
-const K_DOGEMAP: u32 = 1 << 13;
-const K_OTHER: u32 = 1 << 14;
+pub(crate) const K_DOGEMAP: u32 = 1 << 13;
+pub(crate) const K_OTHER: u32 = 1 << 14;
 
 pub fn kind_index(name: &str) -> Option<usize> {
   KIND_NAMES.iter().position(|k| *k == name)
@@ -406,6 +413,7 @@ pub async fn backfill_inscription_seq(config: Config) -> Result<()> {
 /// Numbers up to `max` more inscriptions, in chain order, down to `through`
 /// height. Returns how many rows of `inscription_seq` it consumed.
 fn number_some(db: &store::Db, through: u64, max: usize) -> Result<usize> {
+  let _w = NUMBER_WRITE.lock().unwrap_or_else(|e| e.into_inner());
   let meta = db.open_tree("meta")?;
   let seq = db.open_tree("inscription_seq")?;
   let numbers = db.open_tree("inscription_number")?;
@@ -457,8 +465,76 @@ fn number_some(db: &store::Db, through: u64, max: usize) -> Result<usize> {
   Ok(consumed)
 }
 
+/// Takes back every number given in blocks at `height` and above, newest
+/// first, and moves the cursor back so those heights are numbered again once
+/// the replacing blocks are indexed. Numbers run in chain order, so these are
+/// always the last ones given. Called by a reorg's rollback, after it has
+/// removed the blocks' `inscription_seq` rows.
+pub(crate) fn unnumber_from(db: &store::Db, height: u64) -> Result<u64> {
+  let _w = NUMBER_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+  let meta = db.open_tree("meta")?;
+  let numbers = db.open_tree("inscription_number")?;
+  let kinds_tree = db.open_tree("inscription_kind_number")?;
+  let genesis = db.open_tree("inscription_genesis")?;
+  let mut st = numbering_state(&meta)?;
+  if st.cursor.is_empty() || seq_height(&st.cursor) < height {
+    return Ok(0);
+  }
+
+  let mut batch = Batch::default();
+  let mut taken = 0u64;
+  while st.next > 0 {
+    let number = st.next - 1;
+    let Some(id) = numbers.get(number.to_be_bytes())? else { break };
+    let Some(raw) = genesis.get(id.as_ref())? else { break };
+    let g: Genesis = bincode::deserialize(raw.as_ref()).context("decode genesis")?;
+    if g.height < height {
+      break;
+    }
+    batch.remove(&numbers, number.to_be_bytes().to_vec());
+    batch.remove(&genesis, id.as_ref().to_vec());
+    for k in 0..KIND_NAMES.len() {
+      if g.kinds & (1 << k) != 0 && st.kind_next[k] > 0 {
+        st.kind_next[k] -= 1;
+        batch.remove(&kinds_tree, kind_key(k, st.kind_next[k]).to_vec());
+      }
+    }
+    st.next = number;
+    taken += 1;
+  }
+  // Just below the first row of `height`: numbering resumes there.
+  st.cursor = match height.checked_sub(1) {
+    Some(h) => seq_key(h, u32::MAX).to_vec(),
+    None => Vec::new(),
+  };
+  batch.insert(&meta, NUMBERING_KEY.to_vec(), bincode::serialize(&st)?);
+  batch.commit(&meta)?;
+  if taken > 0 {
+    warn!("inscription numbering: reorg at block {height} took back {taken} numbers");
+  }
+  Ok(taken)
+}
+
+/// Clears every number, overall and per kind, and the cursor, so numbering
+/// starts again from the first row of `inscription_seq`.
+pub(crate) fn reset_numbering(db: &store::Db) -> Result<()> {
+  let _w = NUMBER_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+  // Number keys are 8 bytes, kind keys 9, genesis keys ASCII ids.
+  db.open_tree("inscription_number")?.delete_range(Vec::new(), vec![0xff; 9])?;
+  db.open_tree("inscription_kind_number")?.delete_range(Vec::new(), vec![0xff; 10])?;
+  db.open_tree("inscription_genesis")?.delete_range(Vec::new(), vec![0xff; 1])?;
+  db.open_tree("meta")?.remove(NUMBERING_KEY)?;
+  Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn number_all_for_test(db: &store::Db, through: u64) -> Result<()> {
+  while number_some(db, through, 1000)? > 0 {}
+  Ok(())
+}
+
 /// Keeps inscription numbers up to date: catches up once the backfill is
-/// done, then follows the chain [`NUMBER_CONFIRMATIONS`] blocks behind.
+/// done, then numbers each block as it is indexed.
 pub async fn run_inscription_numbering(config: Config) -> Result<()> {
   let db = db_of(&config)?;
   let meta = db.open_tree("meta")?;
@@ -469,7 +545,7 @@ pub async fn run_inscription_numbering(config: Config) -> Result<()> {
       continue;
     }
     let indexed = meta_u64(&meta, b"indexed_height")?.unwrap_or(0);
-    let through = indexed.saturating_sub(NUMBER_CONFIRMATIONS);
+    let through = (indexed + 1).saturating_sub(NUMBER_CONFIRMATIONS);
     let db2 = db.clone();
     let consumed = tokio::task::spawn_blocking(move || number_some(&db2, through, 50_000))
       .await
@@ -480,7 +556,7 @@ pub async fn run_inscription_numbering(config: Config) -> Result<()> {
         let st = numbering_state(&meta)?;
         info!("inscription numbering: caught up, {} inscriptions numbered", st.next);
       }
-      sleep(Duration::from_secs(15)).await;
+      sleep(Duration::from_secs(2)).await;
     }
   }
 }
@@ -711,5 +787,38 @@ mod tests {
     assert_eq!(images.get(kind_key(0, 1)).unwrap().unwrap().as_ref(), id(3).as_bytes());
     assert_eq!(number_some(&db, 200, 100).unwrap(), 1);
     assert_eq!(numbering_state(&meta).unwrap().next, 4);
+  }
+
+  #[test]
+  fn a_reorg_takes_back_the_numbers_of_the_blocks_it_removes() {
+    let db = store::Db::temporary().unwrap();
+    let seq = db.open_tree("inscription_seq").unwrap();
+    let id = |n: u8| format!("{}i0", format!("{n:02x}").repeat(32));
+    for (h, i, n, kinds) in [(100u64, 0u32, 1u8, K_IMAGE), (101, 0, 2, K_TEXT), (102, 3, 3, K_IMAGE), (102, 5, 4, K_TEXT)] {
+      seq.insert(seq_key(h, i), seq_value(&id(n), kinds, 1000 + h).unwrap()).unwrap();
+    }
+    assert_eq!(number_some(&db, 102, 100).unwrap(), 4, "numbered at 1 confirmation: the tip block too");
+    let meta = db.open_tree("meta").unwrap();
+    let genesis = db.open_tree("inscription_genesis").unwrap();
+    let numbers = db.open_tree("inscription_number").unwrap();
+    let kinds = db.open_tree("inscription_kind_number").unwrap();
+
+    // A reorg replaces block 102: its rows go (as the undo log does), then its numbers.
+    seq.remove(seq_key(102, 3)).unwrap();
+    seq.remove(seq_key(102, 5)).unwrap();
+    assert_eq!(unnumber_from(&db, 102).unwrap(), 2);
+    let st = numbering_state(&meta).unwrap();
+    assert_eq!((st.next, st.kind_next[kind_index("image").unwrap()], st.kind_next[kind_index("text").unwrap()]), (2, 1, 1));
+    assert!(genesis.get(id(3).as_bytes()).unwrap().is_none() && genesis.get(id(4).as_bytes()).unwrap().is_none());
+    assert!(numbers.get(2u64.to_be_bytes()).unwrap().is_none() && kinds.get(kind_key(0, 1)).unwrap().is_none());
+    assert!(genesis.get(id(2).as_bytes()).unwrap().is_some(), "block 101 keeps its number");
+    assert_eq!(unnumber_from(&db, 102).unwrap(), 0, "nothing left to take back");
+
+    // The new block 102 holds a different inscription: it takes number 2.
+    seq.insert(seq_key(102, 1), seq_value(&id(9), K_IMAGE, 1102).unwrap()).unwrap();
+    assert_eq!(number_some(&db, 102, 100).unwrap(), 1);
+    assert_eq!(numbers.get(2u64.to_be_bytes()).unwrap().unwrap().as_ref(), id(9).as_bytes());
+    assert_eq!(kinds.get(kind_key(0, 1)).unwrap().unwrap().as_ref(), id(9).as_bytes());
+    assert_eq!(numbering_state(&meta).unwrap().next, 3);
   }
 }

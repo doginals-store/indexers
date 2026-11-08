@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
   });
 
   // One-off and resumable: chain order for inscriptions indexed before it
-  // was recorded. Numbering then follows the chain from 6 blocks behind.
+  // was recorded. Numbering then follows the chain, one block behind.
   let c = cfg.clone();
   tokio::spawn(async move {
     if let Err(e) = dogeord_indexer::backfill_inscription_seq(c).await {
@@ -57,6 +57,18 @@ async fn main() -> Result<()> {
     loop {
       if let Err(e) = dogeord_indexer::run_dns_index(c.clone()).await {
         error!("dns index failed, retrying in a minute: {e:#}");
+      }
+      tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+  });
+
+  // D:// (DogeFeed's protocol): posts, comments, quotes and their payments,
+  // checked against the registrar, following the main index.
+  let c = cfg.clone();
+  tokio::spawn(async move {
+    loop {
+      if let Err(e) = dogeord_indexer::run_dfeed_index(c.clone()).await {
+        error!("d:// index stopped, restarting in a minute: {e:#}");
       }
       tokio::time::sleep(Duration::from_secs(60)).await;
     }

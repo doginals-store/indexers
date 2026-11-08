@@ -120,6 +120,28 @@ const KNOWN_TREES: &[&str] = &[
   "dns_config",
   "dns_primary",
   "dns_stats",
+  // last inscription_seq key of a DNS step -> the values it overwrote, for
+  // undoing it on a reorg (recent steps only)
+  "dns_undo",
+  // DRC-20 state rebuilt by the one-off replay (drc20_replay.rs), swapped in
+  // for the live trees when it reaches the tip
+  "drc20r_token_info",
+  "drc20r_balance",
+  "drc20r_transferable",
+  "drc20r_deploy",
+  "drc20r_activity",
+  "dfeed_rec",
+  "dfeed_idx",
+  "tap_deploy",
+  "tap_holders",
+  "tap_account",
+  "tap_event",
+  "tap_tick_event",
+  "tap_addr_event",
+  "tap_count",
+  "repair_partial",
+  "repair_found",
+  "repair_body",
 ];
 
 fn cf_options(write_buffer_mb: usize, cache: &Cache) -> Options {
@@ -173,6 +195,18 @@ pub struct Db {
 impl Db {
   pub fn open(path: &str, cache_mb: usize) -> Result<Self> {
     Self::open_inner(Path::new(path), cache_mb, None)
+  }
+
+  /// A read-only view of a database another process has open, for tools that
+  /// inspect the live index without stopping it. `scratch` is where RocksDB
+  /// keeps this view's own small files.
+  pub fn open_secondary(path: &str, scratch: &str) -> Result<Self> {
+    let mut opts = Options::default();
+    opts.set_max_open_files(-1);
+    let names = Rdb::list_cf(&Options::default(), path).with_context(|| format!("list column families at {path}"))?;
+    let db = Rdb::open_cf_as_secondary(&opts, path, scratch, &names)
+      .with_context(|| format!("open rocksdb at {path} as secondary"))?;
+    Ok(Db { inner: Arc::new(db), create_lock: RwLock::new(()), temp_path: None })
   }
 
   /// Temporary database in the system temp directory, deleted on drop.
@@ -337,12 +371,41 @@ pub struct Tree {
 /// Writes to any number of trees that land together or not at all.
 #[derive(Default)]
 pub struct Batch {
-  ops: Vec<(String, Vec<u8>, Vec<u8>)>,
+  /// Tree, key, and the value to put (None deletes the key).
+  ops: Vec<(String, Vec<u8>, Option<Vec<u8>>)>,
 }
 
 impl Batch {
   pub fn insert(&mut self, tree: &Tree, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
-    self.ops.push((tree.name.clone(), key.into(), value.into()));
+    self.ops.push((tree.name.clone(), key.into(), Some(value.into())));
+  }
+
+  pub fn remove(&mut self, tree: &Tree, key: impl Into<Vec<u8>>) {
+    self.ops.push((tree.name.clone(), key.into(), None));
+  }
+
+  /// A write to the tree named `name`: `Some` puts, `None` deletes.
+  pub fn put_raw(&mut self, name: String, key: Vec<u8>, value: Option<Vec<u8>>) {
+    self.ops.push((name, key, value));
+  }
+
+  /// What each key this batch writes holds now, in the same form as the
+  /// writes: putting these back undoes the batch. Read through `tree`'s
+  /// database; a key written twice is recorded once.
+  pub fn previous(&self, tree: &Tree) -> Result<Vec<(String, Vec<u8>, Option<Vec<u8>>)>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (name, key, _) in &self.ops {
+      if !seen.insert((name.as_str(), key.as_slice())) {
+        continue;
+      }
+      let cf = tree
+        .db
+        .cf_handle(name)
+        .with_context(|| format!("missing column family {name}"))?;
+      out.push((name.clone(), key.clone(), tree.db.get_cf(&cf, key)?));
+    }
+    Ok(out)
   }
 
   /// Applies every write atomically, through the database `tree` belongs to.
@@ -356,7 +419,10 @@ impl Batch {
         .db
         .cf_handle(name)
         .with_context(|| format!("missing column family {name}"))?;
-      wb.put_cf(&cf, key, value);
+      match value {
+        Some(v) => wb.put_cf(&cf, key, v),
+        None => wb.delete_cf(&cf, key),
+      }
     }
     tree.db.write(wb).map_err(|e| anyhow::anyhow!("rocksdb batch: {e}"))
   }

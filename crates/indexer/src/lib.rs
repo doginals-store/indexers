@@ -1,11 +1,26 @@
 mod store;
 mod insc_index;
 mod dns;
+mod tap;
+mod repair;
+mod renumber;
+mod drc20_replay;
+mod dfeed;
 
 pub use dns::{
   ClaimEntry, DnsConfigView, DnsListed, DnsName, DnsNameView, DnsPage, DnsRecords, DnsRole, DnsStatus, DnsSupply, dns_claims,
   FEATURED_NAMESPACES, dns_featured, dns_get, dns_list, dns_names_of, dns_namespaces, dns_primary, dns_role, dns_status, dns_supply, normalize_name,
   run_dns_index,
+};
+
+pub use repair::{inscription_repair_done, run_inscription_repair};
+pub use renumber::{renumber_done, run_renumber};
+pub use drc20_replay::{drc20_replay_done, run_drc20_replay};
+pub use dfeed::{DfRecord, DfeedStatus, dfeed_by_account, dfeed_by_inscription, dfeed_by_txid, dfeed_pointing_at, dfeed_records, dfeed_status, run_dfeed_index};
+
+pub use tap::{
+  TAP_KINDS, TapHolder, TapScope, TapStatus, TapToken, run_tap_sync, tap_account, tap_activity, tap_holders, tap_status, tap_tick_key,
+  tap_token, tap_tokens,
 };
 
 pub use insc_index::{
@@ -978,7 +993,10 @@ pub async fn run_indexer(
             "reorg detected at height {}: expected prev hash {}, node reported {}",
             next_height, expected, prev_blockhash
           );
-          rollback_one_height(&db, &blocks, &meta, &undo_by_height, next_height - 1)?;
+          {
+            let _w = repair::INDEX_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+            rollback_one_height(&db, &blocks, &meta, &undo_by_height, next_height - 1)?;
+          }
           next_height = next_height.saturating_sub(1);
           state.set_indexed_height(next_height.saturating_sub(1)).await;
           // Anything already prefetched belongs to the chain we just walked
@@ -996,6 +1014,9 @@ pub async fn run_indexer(
     // is pure waste.
     let txs = &block.tx;
 
+    // The inscription repair adds what it recovered between two blocks, so a
+    // block's writes happen under this lock.
+    let write_guard = repair::INDEX_WRITE.lock().unwrap_or_else(|e| e.into_inner());
     let mut undo = UndoRecorder::default();
     index_block(
       &config,
@@ -1035,6 +1056,7 @@ pub async fn run_indexer(
     undo_by_height.insert(encode_u64(next_height), undo_blob)?;
     blocks.insert(encode_u64(next_height), block.hash.as_bytes())?;
     meta.insert(b"indexed_height", encode_u64(next_height).to_vec())?;
+    drop(write_guard);
 
     // Flush periodically rather than every block. An fsync per block dominated
     // per-block cost during backfill. Always flush once caught up to the tip,
@@ -1189,6 +1211,10 @@ fn rollback_one_height(
       }
     }
   }
+  // Numbers given in this block (its `inscription_seq` rows are gone now).
+  insc_index::unnumber_from(db, height)?;
+  // And DNS steps that read it.
+  dns::undo_from(db, height)?;
 
   blocks.remove(key)?;
   undo_by_height.remove(key)?;
@@ -1505,12 +1531,14 @@ fn index_block(
     PHASE_INPUTS_NS.fetch_add(inputs_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
 
     let script_start = Instant::now();
-    let parsed_inscription = process_inscription_candidate(
-      tx,
-      prep.script_sig.as_deref(),
-      partial_inscription_chain,
-      undo,
-    )?;
+    // As ord-dogecoin: a transaction whose inputs already carry an inscription
+    // on their very first sat cannot reveal one, so it is not read for one
+    // (and does not take part in a reveal chain).
+    let parsed_inscription = if carried.iter().any(|c| c.absolute_offset == 0) {
+      None
+    } else {
+      process_inscription_candidate(tx, prep.script_sig.as_deref(), partial_inscription_chain, undo)?
+    };
     let new_inscription_id = parsed_inscription
       .as_ref()
       .map(|p| format!("{}i0", p.inscription_txid));
@@ -2991,32 +3019,35 @@ fn process_inscription_candidate(
     return Ok(None);
   };
 
+  // A reveal chain continues in the transaction whose input 0 spends the
+  // chain's last transaction. The chain is only taken off the books once that
+  // spend actually continues it (it parses as partial or complete): any other
+  // spend of the same transaction, such as its change output paid on in an
+  // ordinary payment earlier in the block, must leave it in place. Dropping
+  // it there lost every inscription whose next piece came after such a spend,
+  // and ord-dogecoin keeps it ("ParsedInscription::None => {}").
   let prev_txid = tx.vin.first().and_then(|vin| vin.txid.clone());
-  let mut chain = if let Some(prev) = prev_txid.as_deref() {
-    match partial_inscription_chain.get(prev.as_bytes())? {
-      Some(raw) => {
-        undo.remove(
-          "partial_inscription_chain",
-          partial_inscription_chain,
-          prev.as_bytes(),
-        )?;
-        bincode::deserialize::<PartialInscriptionChain>(raw.as_ref())?
-      }
-      None => PartialInscriptionChain {
-        start_txid: tx.txid.clone(),
-        scripts: Vec::new(),
-      },
-    }
-  } else {
-    PartialInscriptionChain {
-      start_txid: tx.txid.clone(),
-      scripts: Vec::new(),
-    }
+  let existing = match prev_txid.as_deref() {
+    Some(prev) => partial_inscription_chain
+      .get(prev.as_bytes())?
+      .map(|raw| bincode::deserialize::<PartialInscriptionChain>(raw.as_ref()))
+      .transpose()?,
+    None => None,
   };
+  let continues = existing.is_some();
+  let mut chain = existing.unwrap_or_else(|| PartialInscriptionChain {
+    start_txid: tx.txid.clone(),
+    scripts: Vec::new(),
+  });
 
   chain.scripts.push(script);
 
-  match parse_inscription_outcome(&chain.scripts) {
+  let outcome = parse_inscription_outcome(&chain.scripts);
+  if continues && !matches!(outcome, InscriptionParseOutcome::None) {
+    let prev = prev_txid.as_deref().expect("a continued chain has a previous txid");
+    undo.remove("partial_inscription_chain", partial_inscription_chain, prev.as_bytes())?;
+  }
+  match outcome {
     InscriptionParseOutcome::Complete(content_type, body, delegate) => {
       Ok(Some(ParsedInscriptionData {
         content_type,
@@ -3219,11 +3250,11 @@ fn address_outpoint_key(address: &str, txid: &str, vout: u32) -> String {
   format!("{address}|{txid}:{vout}")
 }
 
-fn encode_u64(v: u64) -> [u8; 8] {
+pub(crate) fn encode_u64(v: u64) -> [u8; 8] {
   v.to_be_bytes()
 }
 
-fn decode_u64(b: &[u8]) -> Result<u64> {
+pub(crate) fn decode_u64(b: &[u8]) -> Result<u64> {
   if b.len() != 8 {
     warn!("invalid u64 byte length: {}", b.len());
     return Err(anyhow!("invalid u64 bytes"));
@@ -3291,6 +3322,259 @@ pub fn list_spendable_utxos_for_address(config: &Config, address: &str) -> Resul
   }
 
   Ok(utxos)
+}
+
+/// An inscription sitting on an unspent output, `offset` koinu into it.
+#[derive(Debug, Serialize, Clone)]
+pub struct UnspentInscription {
+  pub id: String,
+  pub offset: u64,
+}
+
+/// A Dune balance on an unspent output, as a raw integer string.
+#[derive(Debug, Serialize, Clone)]
+pub struct UnspentDune {
+  pub id: String,
+  pub amount: String,
+}
+
+/// An unspent DRC-20 transfer inscription on the output: spending it moves
+/// (or, sent anywhere but its intended place, burns) `amount`, a raw integer
+/// scaled by 10^decimals.
+#[derive(Debug, Serialize, Clone)]
+pub struct UnspentDrc20 {
+  pub inscription_id: String,
+  pub tick: String,
+  pub amount: String,
+  pub decimals: u8,
+}
+
+/// One unspent output of an address with everything it carries.
+#[derive(Debug, Serialize, Clone)]
+pub struct Unspent {
+  pub txid: String,
+  pub vout: u32,
+  pub satoshis: u64,
+  /// True when the output carries no inscription and no Dune, so spending it
+  /// as plain DOGE loses nothing.
+  pub spendable: bool,
+  pub inscriptions: Vec<UnspentInscription>,
+  pub dunes: Vec<UnspentDune>,
+  pub drc20: Vec<UnspentDrc20>,
+}
+
+/// Every unspent output of `address`, each with the inscriptions, Dunes and
+/// DRC-20 transfer inscriptions it carries, in outpoint order. Costs about
+/// what `list_spendable_utxos_for_address` does: one point read per output.
+pub fn list_unspent_for_address(config: &Config, address: &str) -> Result<Vec<Unspent>> {
+  let db = open_db(&config.db_path())?;
+  let outpoints_by_address = db.open_tree("outpoints_by_address")?;
+  let inscriptions_by_outpoint = db.open_tree("inscriptions_by_outpoint")?;
+  let dune_balances_by_outpoint = db.open_tree("dune_balances_by_outpoint")?;
+  let transferable_tree = db.open_tree("drc20_transferable_by_id")?;
+  let token_tree = db.open_tree("drc20_token_info")?;
+
+  let prefix = format!("{address}|");
+  let mut candidates = Vec::new();
+  for item in outpoints_by_address.scan_prefix(prefix.as_bytes())? {
+    let (k, v) = item?;
+    let key = String::from_utf8(k.to_vec()).context("invalid address/outpoint key utf8")?;
+    let outpoint = key
+      .split_once('|')
+      .map(|(_, op)| op.to_string())
+      .ok_or_else(|| anyhow!("invalid address outpoint key format"))?;
+    candidates.push((outpoint, decode_u64(v.as_ref())?));
+  }
+  if candidates.is_empty() {
+    return Ok(Vec::new());
+  }
+
+  // Few outputs hold Dunes: read them all once, as the spendable list does.
+  let mut dunes: HashMap<String, Vec<UnspentDune>> = HashMap::new();
+  for item in dune_balances_by_outpoint.scan_prefix(b"")? {
+    let (k, v) = item?;
+    let key = String::from_utf8(k.to_vec()).context("invalid dune key utf8")?;
+    if let Some((outpoint, dune_id)) = key.split_once('|') {
+      let amount = decode_u128(v.as_ref())?;
+      if amount > 0 {
+        dunes
+          .entry(outpoint.to_string())
+          .or_default()
+          .push(UnspentDune { id: dune_id.to_string(), amount: amount.to_string() });
+      }
+    }
+  }
+
+  let mut decimals: HashMap<String, u8> = HashMap::new();
+  let mut out = Vec::with_capacity(candidates.len());
+  for chunk in candidates.chunks(4096) {
+    let keys: Vec<&str> = chunk.iter().map(|(outpoint, _)| outpoint.as_str()).collect();
+    let inscribed = inscriptions_by_outpoint.multi_get(&keys)?;
+    for ((outpoint, sats), hit) in chunk.iter().zip(inscribed) {
+      let Some((txid, vout)) = outpoint.split_once(':') else { continue };
+      let Ok(vout) = vout.parse::<u32>() else { continue };
+      let mut entries: Vec<(u64, String)> = match hit {
+        Some(raw) => bincode::deserialize(raw.as_ref()).context("decode inscriptions_by_outpoint")?,
+        None => Vec::new(),
+      };
+      entries.sort();
+      let mut drc20 = Vec::new();
+      for (_, id) in &entries {
+        if let Some(raw) = transferable_tree.get(id.as_bytes())? {
+          let lock: Drc20Transferable = bincode::deserialize(raw.as_ref())?;
+          let dec = match decimals.get(&lock.tick) {
+            Some(d) => *d,
+            None => {
+              let d = match token_tree.get(token_key(&lock.tick).as_bytes())? {
+                Some(raw) => bincode::deserialize::<Drc20TokenInfo>(raw.as_ref())?.decimals,
+                None => 0,
+              };
+              decimals.insert(lock.tick.clone(), d);
+              d
+            }
+          };
+          drc20.push(UnspentDrc20 {
+            inscription_id: id.clone(),
+            tick: lock.tick,
+            amount: lock.amount.to_string(),
+            decimals: dec,
+          });
+        }
+      }
+      let dunes_here = dunes.remove(outpoint).unwrap_or_default();
+      out.push(Unspent {
+        txid: txid.to_string(),
+        vout,
+        satoshis: *sats,
+        spendable: entries.is_empty() && dunes_here.is_empty(),
+        inscriptions: entries.into_iter().map(|(offset, id)| UnspentInscription { id, offset }).collect(),
+        dunes: dunes_here,
+        drc20,
+      });
+    }
+  }
+  Ok(out)
+}
+
+/// Which inscriptions a wallet list leaves out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletExclude {
+  Nothing,
+  /// Every DRC-20 inscription: deploys, mints and transfers.
+  Drc20,
+  /// DRC-20 transfer inscriptions only, as NFT-only wallet lists do.
+  Drc20Transfer,
+}
+
+/// One row of a wallet's inscriptions, with what callers need to tell an NFT
+/// from a token operation without another request per row.
+#[derive(Debug, Clone)]
+pub struct WalletInscription {
+  pub rec: InscriptionRecord,
+  /// None until numbered (the newest block, for a few seconds).
+  pub number: Option<u64>,
+  pub kinds: u32,
+  /// For a DRC-20 inscription: its operation and ticker, as inscribed.
+  pub drc20: Option<(String, String)>,
+}
+
+/// DRC-20 operation and ticker of an inscription's content, as inscribed.
+fn drc20_op_of(content: &store::Tree, id: &str) -> Result<Option<(String, String)>> {
+  let Some(raw) = content.get(id.as_bytes())? else { return Ok(None) };
+  let c = decode_inscription_content(raw.as_ref())?;
+  let Ok(v) = serde_json::from_slice::<serde_json::Value>(&c.body) else { return Ok(None) };
+  match (v.get("op").and_then(|o| o.as_str()), v.get("tick").and_then(|t| t.as_str())) {
+    (Some(op), Some(tick)) => Ok(Some((op.to_ascii_lowercase(), tick.to_string()))),
+    _ => Ok(None),
+  }
+}
+
+/// A wallet's inscriptions, newest id first like
+/// [`list_inscriptions_for_address`], each with its number, kinds and DRC-20
+/// operation. `exclude` filters before paging, so `total` counts what is
+/// listed.
+pub fn list_wallet_inscriptions(
+  config: &Config,
+  address: &str,
+  page: usize,
+  limit: usize,
+  exclude: WalletExclude,
+) -> Result<(usize, Vec<WalletInscription>)> {
+  let db = open_db(&config.db_path())?;
+  let by_address = db.open_tree("inscriptions_by_address")?;
+  let by_id = db.open_tree("inscriptions_by_id")?;
+  let genesis = db.open_tree("inscription_genesis")?;
+  let content = db.open_tree("inscription_content")?;
+
+  let prefix = format!("{address}|");
+  let mut ids = Vec::new();
+  for item in by_address.scan_prefix(prefix.as_bytes())? {
+    let (k, _v) = item?;
+    let key = String::from_utf8(k.to_vec()).context("invalid inscriptions_by_address key utf8")?;
+    if let Some((_, id)) = key.split_once('|') {
+      ids.push(id.to_string());
+    }
+  }
+  ids.sort();
+  ids.reverse();
+
+  // Kinds come from numbering; one not numbered yet is classified from its
+  // content, as numbering would.
+  let kinds_of_ids = |ids: &[String]| -> Result<Vec<(u32, Option<u64>)>> {
+    let mut out = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(4096) {
+      for (id, raw) in chunk.iter().zip(genesis.multi_get(chunk)?) {
+        out.push(match raw {
+          Some(r) => {
+            let g: insc_index::Genesis = bincode::deserialize(r.as_ref()).context("decode genesis")?;
+            (g.kinds, Some(g.number))
+          }
+          None => match content.get(id.as_bytes())? {
+            Some(r) => {
+              let c = decode_inscription_content(r.as_ref())?;
+              (kinds_of(&c.content_type, Some(&c.body)), None)
+            }
+            None => (0, None),
+          },
+        });
+      }
+    }
+    Ok(out)
+  };
+  let is_drc20 = |kinds: u32| kind_names(kinds).contains(&"drc20");
+
+  if exclude != WalletExclude::Nothing {
+    let kinds = kinds_of_ids(&ids)?;
+    let mut kept = Vec::with_capacity(ids.len());
+    for (id, (k, _)) in ids.into_iter().zip(kinds) {
+      let drop = is_drc20(k)
+        && match exclude {
+          WalletExclude::Drc20 => true,
+          _ => drc20_op_of(&content, &id)?.is_some_and(|(op, _)| op == "transfer"),
+        };
+      if !drop {
+        kept.push(id);
+      }
+    }
+    ids = kept;
+  }
+
+  let total = ids.len();
+  let start = page.saturating_sub(1).saturating_mul(limit).min(total);
+  let end = start.saturating_add(limit).min(total);
+  let page_ids = &ids[start..end];
+  let kinds = kinds_of_ids(page_ids)?;
+  let mut out = Vec::with_capacity(page_ids.len());
+  for (id, (k, number)) in page_ids.iter().zip(kinds) {
+    let Some(raw) = by_id.get(id.as_bytes())? else { continue };
+    out.push(WalletInscription {
+      rec: decode_inscription_record(raw.as_ref())?,
+      number,
+      kinds: k,
+      drc20: if is_drc20(k) { drc20_op_of(&content, id)? } else { None },
+    });
+  }
+  Ok((total, out))
 }
 
 pub fn list_inscriptions_for_address(
@@ -5277,6 +5561,47 @@ mod tests {
     );
   }
 
+  /// The bug DogeFeed found (e.g. 46e658a6…i0, 176 pieces): an ordinary
+  /// payment spending the chain's last transaction (its change output) came
+  /// earlier in the block than the next piece, and used to throw the chain
+  /// away. ord-dogecoin keeps it, and so must we.
+  #[test]
+  fn a_non_continuation_spend_leaves_the_chain_for_the_real_next_piece() {
+    let db = test_db();
+    let partial = db.open_tree("partial_inscription_chain").unwrap();
+    let mut undo = UndoRecorder::default();
+    let tx = |txid: &str, prev: &str, script: Vec<u8>| RpcTx {
+      txid: txid.to_string(),
+      vin: vec![RpcVin { txid: Some(prev.to_string()), vout: Some(1), script_sig: Some(RpcScriptSig { hex: hex::encode(script) }) }],
+      vout: vec![],
+    };
+    let run = |t: &RpcTx, undo: &mut UndoRecorder| {
+      process_inscription_candidate(t, decode_script_sig_bytes(t).as_deref(), &partial, undo).unwrap()
+    };
+
+    let a = tx("txa", "funding", script_from_pushes(&[b"ord", &[3], b"image/webp", &[2], b"aa"], Some(0x75)));
+    assert!(run(&a, &mut undo).is_none());
+    // A plain signature-and-key spend of txa's change: not a continuation.
+    let pay = tx("txpay", "txa", script_from_pushes(&[b"signature-bytes-here", b"public-key-bytes"], None));
+    assert!(run(&pay, &mut undo).is_none());
+    assert!(partial.get("txa".as_bytes()).unwrap().is_some(), "the chain is still waiting for its next piece");
+    // The real next piece, then the last.
+    let b = tx("txb", "txa", script_from_pushes(&[&[1], b"bb"], Some(0x75)));
+    assert!(run(&b, &mut undo).is_none());
+    assert!(partial.get("txa".as_bytes()).unwrap().is_none() && partial.get("txb".as_bytes()).unwrap().is_some());
+    let c = tx("txc", "txb", script_from_pushes(&[&[0], b"cc"], Some(0x75)));
+    let done = run(&c, &mut undo).expect("complete");
+    assert_eq!((done.inscription_txid.as_str(), done.content_type.as_str(), done.body.as_slice()), ("txa", "image/webp", &b"aabbcc"[..]));
+    assert!(partial.get("txb".as_bytes()).unwrap().is_none());
+
+    // A piece that does not follow the countdown also leaves the chain.
+    let d = tx("txd", "funding2", script_from_pushes(&[b"ord", &[2], b"text/plain", &[1], b"d1"], Some(0x75)));
+    assert!(run(&d, &mut undo).is_none());
+    let wrong = tx("txw", "txd", script_from_pushes(&[&[5], b"zz"], Some(0x75)));
+    assert!(run(&wrong, &mut undo).is_none());
+    assert!(partial.get("txd".as_bytes()).unwrap().is_some());
+  }
+
   #[test]
   fn process_inscription_candidate_stitches_chain_by_vin0_prev_txid() {
     let db = test_db();
@@ -5554,5 +5879,41 @@ mod tests {
     assert!(newer.starts_with("T|ABCD|"));
     assert!(!activity_key(&drc20_scope("ABCE"), 200, 0, "x").starts_with("T|ABCD|"));
     assert!(activity_key(&dune_scope("DOGECOIN:B"), 1, 0, "mint").starts_with("D|DOGECOIN:B|"));
+  }
+}
+
+#[cfg(test)]
+mod chain_file_tests {
+  use super::*;
+
+  /// Parses a reveal chain written by scratchpad/chain.mjs (input-0 scripts,
+  /// hex, one per line). Skipped by default: CHAIN_FILE=<path> cargo test
+  /// -p dogeord-indexer chain_file -- --ignored --nocapture
+  #[test]
+  #[ignore]
+  fn chain_file_parses() {
+    let path = std::env::var("CHAIN_FILE").expect("CHAIN_FILE");
+    let text = std::fs::read_to_string(path).unwrap();
+    let scripts: Vec<Vec<u8>> = text.lines().filter(|l| !l.trim().is_empty()).map(|l| hex::decode(l.trim()).unwrap()).collect();
+    // As the indexer sees it: the chain grows one transaction at a time, and a
+    // spend that does not continue it is passed over.
+    let mut chain: Vec<Vec<u8>> = Vec::new();
+    let mut skipped = 0;
+    for (n, s) in scripts.iter().enumerate() {
+      chain.push(s.clone());
+      match parse_inscription_outcome(&chain) {
+        InscriptionParseOutcome::Complete(ct, body, _) => {
+          println!("complete after {} of {} scripts ({skipped} passed over): {ct}, {} bytes", n + 1, scripts.len(), body.len());
+          return;
+        }
+        InscriptionParseOutcome::None if n == 0 => panic!("the first script is not an envelope"),
+        InscriptionParseOutcome::None => {
+          chain.pop();
+          skipped += 1;
+        }
+        InscriptionParseOutcome::Partial => {}
+      }
+    }
+    panic!("still partial after all {} scripts", scripts.len());
   }
 }
