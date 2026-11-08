@@ -34,6 +34,10 @@ use crate::{RpcBlock, RpcTx, decode_inscription_content, indexer_rpc_client, rpc
 /// First block read: before the first D:// v1 record (block 6,448,293).
 pub const START: u64 = 6_440_000;
 const STATE_KEY: &[u8] = b"dfeed_state_v1";
+/// What stored records hold. Raising it clears them and reads D:// again
+/// from START (a few minutes): 2 added the registrar key and reveal payouts.
+const VERSION: u64 = 2;
+const VERSION_KEY: &[u8] = b"dfeed_version";
 /// Block hashes kept to notice a reorg.
 const KEEP_HASHES: usize = 100;
 
@@ -78,9 +82,16 @@ pub struct DfRecord {
   pub label: Option<String>,
   #[serde(default)]
   pub ops: Vec<String>,
+  /// Who it pays, and how much: from the OP_RETURN payment, or for a comment
+  /// or quote, what its reveal pays the original author it answers.
   pub recipient: Option<String>,
   pub recipient_koinu: Option<u64>,
+  /// What it pays DogeFeed.
   pub fee_koinu: Option<u64>,
+  /// The registrar key (`kid`) whose signature on it verifies: DogeFeed's
+  /// signature, showing it was issued through DogeFeed.
+  #[serde(default)]
+  pub registrar: Option<String>,
   /// Read from the body joined with the reveal's extra pushes.
   #[serde(default)]
   pub split_body: bool,
@@ -252,9 +263,17 @@ fn inscription_record(t: &Trees, height: u64, i: u32, time: u64, tx: &RpcTx, id:
     label: rec.keylink.as_ref().map(|k| k.label.clone()),
     ops: rec.keylink.as_ref().map(|k| k.ops.clone()).unwrap_or_default(),
     split_body: split,
+    registrar: dproto::attestation_key(&rec).map(str::to_string),
     ..Default::default()
   };
   let outputs = outputs_of(tx)?;
+  r.fee_koinu = Some(dproto::paid_to(&outputs, dproto::FEE_ADDRESS));
+  if matches!(rec.rtype, RecordType::Comment | RecordType::Quote)
+    && let Some(parent) = rec.reference.as_deref().map(|p| by_inscription(t, p)).transpose()?.flatten()
+  {
+    r.recipient_koinu = Some(dproto::paid_to(&outputs, &parent.author));
+    r.recipient = Some(parent.author);
+  }
   let check = || -> Result<(), String> {
     if content_type.split(';').next().unwrap_or("").trim() != "application/json" {
       return Err(format!("content type is {content_type:?}, not application/json"));
@@ -329,7 +348,7 @@ async fn payment_record(config: &Config, t: &Trees, height: u64, i: u32, time: u
   let _ = config;
   let ptx = PaymentTx { inputs: &inputs, input_addresses: &addrs, outputs: &outputs };
   let keys = |author: &str| linked_keys(t, author);
-  let verdict = dproto::verify_payment(&ptx, &dproto::registrar_pubkeys(), |target| post_candidates(t, target), keys);
+  let verdict = dproto::verify_payment_by_key(&ptx, |target| post_candidates(t, target), keys);
   let payer = addrs.first().cloned().flatten().unwrap_or_default();
   let mut r = DfRecord { txid: tx.txid.clone(), height, tx_index: i, time, author: payer.clone(), account: payer, ..Default::default() };
   match verdict {
@@ -343,7 +362,8 @@ async fn payment_record(config: &Config, t: &Trees, height: u64, i: u32, time: u
         .unwrap_or_else(|| "unknown".into());
       r.reason = Some(e);
     }
-    Ok(Some(p)) => {
+    Ok(Some((p, kid))) => {
+      r.registrar = Some(kid.to_string());
       r.kind = p.op.name().into();
       r.account = if p.op == Op::Keyrevoke { p.author.clone() } else { account_for(t, &p.author, p.op.name(), height)? };
       r.author = p.author;
@@ -514,6 +534,13 @@ pub async fn run_dfeed_index(config: Config) -> Result<()> {
   let db = ii::db_of(&config)?;
   let t = Trees::open(&db)?;
   let client = indexer_rpc_client()?;
+  if ii::meta_u64(&t.meta, VERSION_KEY)?.unwrap_or(1) < VERSION {
+    t.rec.delete_range(vec![0u8], vec![0xffu8; 13])?;
+    t.idx.delete_range(vec![0u8], vec![0xffu8])?;
+    t.meta.remove(STATE_KEY)?;
+    t.meta.insert(VERSION_KEY, VERSION.to_be_bytes())?;
+    info!("d:// index: records are now version {VERSION}; reading D:// again from block {START}");
+  }
   let mut st = load_state(&t.meta)?;
   info!("d:// index: starting at block {}, {} records ({} valid)", st.next_height, st.records, st.valid);
   let (mut last_log, mut caught_up) = (Instant::now(), false);
@@ -718,6 +745,17 @@ mod tests {
     let pointing = by_index_prefix(&t, &format!("g|{post}|")).unwrap();
     assert_eq!(pointing.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(), ["like", "branch", "tip", "comment", "quote"]);
     assert!(all.iter().filter(|r| r.inscription_id.is_some()).all(|r| r.split_body));
+    // DogeFeed's note of Nov 8, 2026: every record carries its signature, and
+    // the comment and quote pay the post's author 0.86 and DogeFeed 0.1 DOGE.
+    assert!(all.iter().all(|r| r.registrar.as_deref() == Some("dfreg1")));
+    for r in all.iter().filter(|r| matches!(r.kind.as_str(), "comment" | "quote")) {
+      assert_eq!(
+        (r.recipient.as_deref(), r.recipient_koinu, r.fee_koinu),
+        (Some("DSi6So8MHAArNYSgWxhpVrU6PtfHgVa11N"), Some(86_000_000), Some(10_000_000)),
+        "{}",
+        r.kind
+      );
+    }
     let follow = &all[0];
     assert_eq!(
       (follow.author.as_str(), follow.target.as_deref(), follow.recipient_koinu, follow.fee_koinu),

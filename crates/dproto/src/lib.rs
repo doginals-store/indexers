@@ -582,12 +582,21 @@ pub fn verify_record_signatures(rec: &Record) -> Result<(), String> {
   if !verify_message(&rec.addr, &rec.sig, &signed) {
     return Err("the author's signature does not verify".into());
   }
-  let h = hex::encode(sha256(format!("{signed}{}", rec.sig).as_bytes()));
-  let registrar = registrar_address(&rec.kid).ok_or_else(|| format!("unknown registrar key {:?}", rec.kid))?;
-  if !verify_message(registrar, &rec.att_sig, &format!("D://-att:v1:{h}")) {
+  registrar_address(&rec.kid).ok_or_else(|| format!("unknown registrar key {:?}", rec.kid))?;
+  if attestation_key(rec).is_none() {
     return Err("the registrar's attestation does not verify".into());
   }
   Ok(())
+}
+
+/// The registrar key (`kid`) whose attestation on this record verifies, if
+/// any: DogeFeed's signature, showing the record was issued through DogeFeed.
+/// It signs over the author's signature, so it is checked apart from it.
+pub fn attestation_key(rec: &Record) -> Option<&'static str> {
+  let signed = signed_string(rec).ok()?;
+  let h = hex::encode(sha256(format!("{signed}{}", rec.sig).as_bytes()));
+  let key = REGISTRAR_KEYS.iter().find(|k| k.kid == rec.kid)?;
+  verify_message(key.address, &rec.att_sig, &format!("D://-att:v1:{h}")).then_some(key.kid)
 }
 
 /// A transaction output: amount and script.
@@ -597,7 +606,8 @@ pub struct TxOut {
   pub script: Vec<u8>,
 }
 
-fn paid_to(outputs: &[TxOut], address: &str) -> u64 {
+/// What the outputs pay an address in all, in koinu.
+pub fn paid_to(outputs: &[TxOut], address: &str) -> u64 {
   let Some(h) = address_hash(address) else { return 0 };
   let script = p2pkh_script(&h);
   outputs.iter().filter(|o| o.script == script).map(|o| o.koinu).sum()
@@ -994,6 +1004,25 @@ pub fn verify_payment(
     recipient: recipient.map(|(v, o)| (v, o.koinu)),
     fee: (fee_vout, fee.koinu),
   }))
+}
+
+/// [`verify_payment`] against each pinned registrar key in turn, with the
+/// `kid` of the key that signed it.
+pub fn verify_payment_by_key(
+  tx: &PaymentTx,
+  posts: impl Fn(&[u8; 11]) -> Vec<PostCandidate>,
+  keys: impl Fn(&str) -> Vec<String>,
+) -> Result<Option<(VerifiedPayment, &'static str)>, String> {
+  let mut last = Err("no registrar key is pinned".to_string());
+  for k in REGISTRAR_KEYS {
+    let Some(pk) = hex::decode(k.pubkey_hex).ok().and_then(|b| PublicKey::from_slice(&b).ok()) else { continue };
+    match verify_payment(tx, &[pk], &posts, &keys) {
+      Ok(Some(v)) => return Ok(Some((v, k.kid))),
+      Ok(None) => return Ok(None),
+      Err(e) => last = Err(e),
+    }
+  }
+  last
 }
 
 /// The reference split of a priced tip or reveal: DogeFeed's 10%, rounded to

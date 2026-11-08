@@ -189,3 +189,29 @@ fn records_that_are_not_v1_dogefeed_are_told_apart() {
   assert!(!is_inscription_id("5EEDF507d704e35c037060e4ac966262b6eae10ef89b9ce2be11d2ec2697c72ei0"));
   assert_eq!(tip_split(100_000_000), (90_000_000, 10_000_000));
 }
+
+#[test]
+fn every_vector_carries_dogefeeds_signature_and_its_payouts() {
+  // DogeFeed's note of Nov 8, 2026: the comment and quote reveals pay the
+  // post's original author 0.86 DOGE and DogeFeed 0.1 DOGE.
+  for name in ["post", "comment", "quote"] {
+    let (rec, tx) = record(name);
+    assert_eq!(attestation_key(&rec), Some("dfreg1"), "{name}");
+    assert_eq!(paid_to(&tx.outputs, FEE_ADDRESS), 10_000_000, "{name}");
+    if name != "post" {
+      assert_eq!(paid_to(&tx.outputs, BOT), 86_000_000, "{name}");
+    }
+  }
+  for name in ["follow", "like", "branch", "tip"] {
+    let tx = vector(name);
+    let (_, kid) = verify_payment_by_key(&PaymentTx { inputs: &tx.inputs, input_addresses: &tx.addrs, outputs: &tx.outputs }, posts, |_| vec![])
+      .unwrap()
+      .unwrap();
+    assert_eq!(kid, "dfreg1", "{name}");
+  }
+  // An attestation from another signature does not carry over.
+  let (mut rec, _) = record("post");
+  rec.text = Some("changed".into());
+  rec.value["b"]["text"] = "changed".into();
+  assert_eq!(attestation_key(&rec), None);
+}
